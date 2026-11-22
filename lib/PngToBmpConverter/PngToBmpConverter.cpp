@@ -2,6 +2,7 @@
 
 #include <HalDisplay.h>
 #include <HalStorage.h>
+#include <ImageBakeQuantizer.h>
 #include <InflateStream.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -446,7 +447,9 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
           targetHeight);
 
   BmpStreamWriter output;
-  if (!output.begin(bmpOut, outWidth, outHeight, oneBit, originalThresholds)) return false;
+  const auto quantize =
+      originalThresholds ? nullptr : (oneBit ? imagebake::quantizeGray1bit : imagebake::quantizeGray2bit);
+  if (!output.begin(bmpOut, outWidth, outHeight, oneBit, originalThresholds, quantize)) return false;
 
   GrayRowScaler scaler;
   if (!scaler.begin(width, height, output)) return false;

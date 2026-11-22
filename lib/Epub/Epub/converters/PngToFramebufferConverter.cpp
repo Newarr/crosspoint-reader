@@ -8,15 +8,18 @@
 #include <PNGdec.h>
 
 #include <algorithm>
-#include <cstdlib>
-#include <memory>
+#include <cstring>
 #include <new>
 
+#include "DecoderStorage.h"
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
 #include "PixelCache.h"
+#include "SampleRowClamp.h"
 
 namespace {
+
+constexpr size_t MAX_GRAY_LINE_BUFFER_BYTES = PNG_MAX_BUFFERED_PIXELS / 2;
 
 // Context struct passed through PNGdec callbacks to avoid global mutable state.
 // The draw callback receives this via pDraw->pUser (set by png.decode()).
@@ -45,53 +48,37 @@ struct PngContext {
 
   uint8_t* grayLineBuffer{nullptr};
   uint8_t* alphaLineBuffer{nullptr};
+  uint8_t* previousGrayLine{nullptr};
+  uint32_t stepX{SAMPLE_ONE};
+  uint32_t stepY{SAMPLE_ONE};
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
 // avoiding the need for global file state.
 void* pngOpenWithHandle(const char* filename, int32_t* size) {
-  HalFile* f = new HalFile();
-  if (!Storage.openFileForRead("PNG", std::string(filename), *f)) {
-    delete f;
-    return nullptr;
-  }
-  *size = f->size();
-  return f;
+  auto file = makeUniqueNoThrow<HalFile>();
+  if (!file || !Storage.openFileForRead("PNG", filename, *file)) return nullptr;
+  const size_t fileSize = file->size();
+  if (fileSize == 0 || fileSize > INT32_MAX) return nullptr;
+  *size = static_cast<int32_t>(fileSize);
+  return file.release();
 }
 
-void pngCloseWithHandle(void* handle) {
-  HalFile* f = reinterpret_cast<HalFile*>(handle);
-  if (f) {
-    f->close();
-    delete f;
-  }
-}
+void pngCloseWithHandle(void* handle) { delete static_cast<HalFile*>(handle); }
 
 int32_t pngReadWithHandle(PNGFILE* pFile, uint8_t* pBuf, int32_t len) {
   HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return 0;
+  if (!f || len <= 0) return 0;
   return f->read(pBuf, len);
 }
 
 int32_t pngSeekWithHandle(PNGFILE* pFile, int32_t pos) {
   HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return -1;
-  return f->seek(pos);
+  if (!f || pos < 0 || !f->seek(pos)) return -1;
+  return pos;
 }
 
-// The PNG decoder (PNGdec) is ~42 KB due to internal zlib decompression buffers.
-// We heap-allocate it on demand rather than using a static instance, so this memory
-// is only consumed while actually decoding/querying PNG images. This is critical on
-// the ESP32-C3 where total RAM is ~320 KB.
-constexpr size_t PNG_DECODER_APPROX_SIZE = 44 * 1024;                          // ~42 KB + overhead
-constexpr size_t MIN_FREE_HEAP_FOR_PNG = PNG_DECODER_APPROX_SIZE + 16 * 1024;  // decoder + 16 KB headroom
-
-// PNGdec keeps TWO scanlines in its internal ucPixels buffer (current + previous)
-// and each scanline includes a leading filter byte.
-// Required storage is therefore approximately: 2 * (pitch + 1) + alignment slack.
-// If PNG_MAX_BUFFERED_PIXELS is smaller than this requirement for a given image,
-// PNGdec can overrun its internal buffer before our draw callback executes.
 int bytesPerPixelFromType(int pixelType) {
   switch (pixelType) {
     case PNG_PIXEL_TRUECOLOR:
@@ -227,112 +214,105 @@ int pngDrawCallback(PNGDRAW* pDraw) {
     return 0;
   }
 
-  int srcY = pDraw->y;
-  int srcWidth = ctx->srcWidth;
-  if (srcY < ctx->cropTop || srcY >= ctx->cropTop + ctx->visibleHeight) return 1;
-  const int visibleSrcY = srcY - ctx->cropTop;
+  const int srcY = pDraw->y - ctx->cropTop;
+  if (srcY < 0 || srcY >= ctx->visibleHeight) return 1;
 
-  // Map source rows with the exact output-height ratio. During downscaling,
-  // multiple source rows can select the same output row; during upscaling, one
-  // source row must be repeated across every output row in its range. Emitting
-  // only the first row of an upscale leaves zero-filled (black) gaps in the
-  // streamed pixel cache.
-  int firstDstY = (visibleSrcY * ctx->dstHeight) / ctx->visibleHeight;
-  int endDstY = firstDstY + 1;
-  if (ctx->dstHeight > ctx->visibleHeight) {
-    endDstY = ((visibleSrcY + 1) * ctx->dstHeight) / ctx->visibleHeight;
+  const bool bilinear = ctx->previousGrayLine != nullptr;
+  const bool cacheOnly = ctx->config->cacheOnly;
+  const int firstDstY = ctx->lastDstY + 1;
+  int endDstY = firstDstY;
+  if (bilinear) {
+    while (endDstY < ctx->dstHeight &&
+           samplePair(samplePosition(endDstY, ctx->stepY), 0, ctx->visibleHeight).second <= srcY) {
+      ++endDstY;
+    }
+    if (firstDstY == endDstY &&
+        (firstDstY == ctx->dstHeight ||
+         samplePair(samplePosition(firstDstY, ctx->stepY), 0, ctx->visibleHeight).first > srcY)) {
+      return 1;
+    }
+  } else {
+    endDstY = (srcY * ctx->dstHeight) / ctx->visibleHeight + 1;
+    if (ctx->dstHeight > ctx->visibleHeight) endDstY = ((srcY + 1) * ctx->dstHeight) / ctx->visibleHeight;
+    if (firstDstY >= endDstY) return 1;
   }
 
-  if (firstDstY <= ctx->lastDstY) firstDstY = ctx->lastDstY + 1;
-  if (firstDstY >= endDstY || firstDstY >= ctx->dstHeight) return 1;
-  if (endDstY > ctx->dstHeight) endDstY = ctx->dstHeight;
-
-  // PNGdec parses tRNS while decoding, after open() returns, so query the
-  // transparent color here rather than caching its pre-decode value.
-  const uint32_t transparentColor = ctx->decoder ? ctx->decoder->getTransparentColor() : 0;
-  convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->iBpp, pDraw->pPalette,
+  const uint32_t transparentColor = ctx->decoder->getTransparentColor();
+  convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, ctx->srcWidth, pDraw->iPixelType, pDraw->iBpp, pDraw->pPalette,
                     pDraw->iHasAlpha, transparentColor, ctx->alphaLineBuffer);
 
-  // Render scaled rows using Bresenham-style integer stepping (no floating-point division)
-  int dstWidth = ctx->dstWidth;
-  int outXBase = ctx->config->x;
-  int screenWidth = ctx->screenWidth;
-  bool useDithering = ctx->config->useDithering;
-
-  // Pre-compute orientation and render-mode state once per callback.
-  DirectPixelWriter pw;
-  pw.init(*ctx->renderer);
+  DirectPixelWriter pw{};
+  if (!cacheOnly) pw.init(*ctx->renderer);
 
   for (int dstY = firstDstY; dstY < endDstY; dstY++) {
     ctx->lastDstY = dstY;
-    int outY = ctx->config->y + dstY;
-    if (outY >= ctx->screenHeight) continue;
+    const int outY = ctx->config->y + dstY;
+    if (!cacheOnly && (outY < 0 || outY >= ctx->screenHeight)) continue;
+    if (!cacheOnly) pw.beginRow(outY);
 
-    pw.beginRow(outY);
-
-    // The cache streams to disk one row at a time. Flushing rows below this one
-    // (PNGdec delivers scanlines top to bottom) repositions the single-row band.
-    // A flush failure stops caching for the rest of the decode so we never write
-    // past the band buffer; finalize() then drops the partial file.
-    bool caching = ctx->caching;
     DirectCacheWriter cw;
-    if (caching) {
+    if (ctx->caching) {
       if (!ctx->cache.advanceTo(dstY)) {
-        caching = false;
         ctx->caching = false;
+        if (cacheOnly) return 0;
       } else {
         cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
         cw.beginRow(outY, ctx->config->y + ctx->cache.bandStart);
       }
     }
 
-    int srcX = ctx->cropLeft;
-    int error = 0;
+    const auto drawSample = [&](int dstX, uint8_t gray) {
+      const int outX = ctx->config->x + dstX;
+      const uint8_t level = ctx->config->useDithering ? applyBayerDither4Level(gray, dstX, dstY) : gray >> 6;
+      if (!cacheOnly) pw.writePixel(outX, level, ctx->alphaLineBuffer != nullptr);
+      if (ctx->caching) cw.writePixel(outX, level);
+    };
 
-    for (int dstX = 0; dstX < dstWidth; dstX++) {
-      int outX = outXBase + dstX;
-      if (outX < screenWidth) {
-        const uint8_t alpha = ctx->alphaLineBuffer ? ctx->alphaLineBuffer[srcX] : 255;
-        if (alpha >= 8 && alpha > alphaThreshold4x4(outX, outY)) {
-          uint8_t gray = ctx->grayLineBuffer[srcX];
-
-          uint8_t ditheredGray;
-          if (useDithering) {
-            ditheredGray = applyBayerDither4Level(gray, outX, outY);
-          } else {
-            ditheredGray = gray >> 6;
-          }
-          pw.writePixel(outX, ditheredGray, ctx->alphaLineBuffer != nullptr);
-          if (caching) cw.writePixel(outX, ditheredGray);
-        }
+    const int startX = cacheOnly ? 0 : std::max(0, -ctx->config->x);
+    const int endX = cacheOnly ? ctx->dstWidth : std::min(ctx->dstWidth, ctx->screenWidth - ctx->config->x);
+    const uint8_t* current = ctx->grayLineBuffer + ctx->cropLeft;
+    if (bilinear) {
+      const SamplePair rows = samplePair(samplePosition(dstY, ctx->stepY), 0, ctx->visibleHeight);
+      const uint8_t* above = rows.first == srcY ? current : ctx->previousGrayLine + ctx->cropLeft;
+      for (int dstX = startX; dstX < endX; dstX++) {
+        const SamplePair cols = samplePair(samplePosition(dstX, ctx->stepX), 0, ctx->visibleWidth);
+        const auto top = interpolateSample(above[cols.first], above[cols.second], cols.fraction);
+        const auto bottom = interpolateSample(current[cols.first], current[cols.second], cols.fraction);
+        drawSample(dstX, static_cast<uint8_t>(interpolateSample(top, bottom, rows.fraction)));
       }
-
-      // Bresenham-style stepping: advance srcX based on ratio visibleWidth/dstWidth
-      error += ctx->visibleWidth;
-      while (error >= dstWidth) {
-        error -= dstWidth;
-        srcX++;
+    } else {
+      for (int dstX = startX; dstX < endX; dstX++) {
+        const int srcX = (dstX * ctx->visibleWidth) / ctx->dstWidth;
+        if (ctx->alphaLineBuffer) {
+          const uint8_t alpha = ctx->alphaLineBuffer[ctx->cropLeft + srcX];
+          if (alpha < 8 || alpha <= alphaThreshold4x4(ctx->config->x + dstX, outY)) continue;
+        }
+        drawSample(dstX, current[srcX]);
       }
     }
   }
+  if (bilinear) std::swap(ctx->grayLineBuffer, ctx->previousGrayLine);
 
   return 1;
 }
 
 }  // namespace
 
-bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
-    return false;
-  }
+bool PngToFramebufferConverter::decoderFitsHeap() {
+#ifdef PNGDEC_CALLER_ROW_BUFFER
+  constexpr size_t cacheBandHeadroom = 4 * 1024;
+  constexpr size_t rowHeadroom = PNG_MAX_BUFFERED_PIXELS + MAX_GRAY_LINE_BUFFER_BYTES + cacheBandHeadroom;
+  constexpr size_t allocatorSlack = 64;
+  return DecoderStorage<PNG>::fitsHeap(rowHeadroom, PNG_MAX_BUFFERED_PIXELS + allocatorSlack);
+#else
+  return DecoderStorage<PNG>::fitsHeap();
+#endif
+}
 
-  std::unique_ptr<PNG> png(new (std::nothrow) PNG());
-  if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder for dimensions");
-    return false;
-  }
+bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
+  DecoderStorage<PNG> storage(false);
+  PNG* png = storage.get();
+  if (!png) return false;
 
   int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
                      nullptr);
@@ -350,25 +330,22 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
                                                     const RenderConfig& config) {
   LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
 
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
-    return false;
-  }
-
-  // Heap-allocate PNG decoder (~42 KB) - freed at end of function
-  std::unique_ptr<PNG> png(new (std::nothrow) PNG());
+  if (config.cacheOnly && (config.cachePath.empty() || config.preserveAlpha)) return false;
+  DecoderStorage<PNG> storage(config.cacheOnly && !renderer.hasFrameBuffer());
+  PNG* png = storage.get();
   if (!png) {
     LOG_ERR("PNG", "Failed to allocate PNG decoder");
     return false;
   }
 
   PngContext ctx;
-  ctx.decoder = png.get();
+  ctx.decoder = png;
   ctx.renderer = &renderer;
   ctx.config = &config;
-  ctx.screenWidth = renderer.getScreenWidth();
-  ctx.screenHeight = renderer.getScreenHeight();
+  if (!config.cacheOnly) {
+    ctx.screenWidth = renderer.getScreenWidth();
+    ctx.screenHeight = renderer.getScreenHeight();
+  }
 
   int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
                      pngDrawCallback);
@@ -408,22 +385,14 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     ctx.dstWidth = (int)(ctx.visibleWidth * ctx.scale);
     ctx.dstHeight = (int)(ctx.visibleHeight * ctx.scale);
   }
-  ctx.lastDstY = -1;  // Reset row tracking
+  if (ctx.dstWidth <= 0 || ctx.dstHeight <= 0 || ctx.dstWidth > INT16_MAX || ctx.dstHeight > INT16_MAX) return false;
+  ctx.stepX = (static_cast<uint32_t>(ctx.visibleWidth) << 16) / ctx.dstWidth;
+  ctx.stepY = (static_cast<uint32_t>(ctx.visibleHeight) << 16) / ctx.dstHeight;
 
   const int pixelType = png->getPixelType();
   const int bitsPerSample = png->getBpp();
   LOG_DBG("PNG", "PNG %dx%d (visible %dx%d) -> %dx%d (scale %.2f), type: %d, bpp: %d", ctx.srcWidth, ctx.srcHeight,
           ctx.visibleWidth, ctx.visibleHeight, ctx.dstWidth, ctx.dstHeight, ctx.scale, pixelType, bitsPerSample);
-
-  const int requiredInternal = requiredPngInternalBufferBytes(ctx.srcWidth, pixelType, bitsPerSample);
-  if (requiredInternal > PNG_MAX_BUFFERED_PIXELS) {
-    LOG_ERR(
-        "PNG",
-        "PNG row buffer too small: need %d bytes for width=%d type=%d bpp=%d, configured PNG_MAX_BUFFERED_PIXELS=%d",
-        requiredInternal, ctx.srcWidth, pixelType, bitsPerSample, PNG_MAX_BUFFERED_PIXELS);
-    LOG_ERR("PNG", "Aborting decode to avoid PNGdec internal buffer overflow");
-    return false;
-  }
 
   if (!isSupportedBitDepth(pixelType, bitsPerSample)) {
     warnUnsupportedFeature(
@@ -431,10 +400,23 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     return false;
   }
 
+  const int requiredInternal = requiredPngInternalBufferBytes(ctx.srcWidth, pixelType, bitsPerSample);
+  if (requiredInternal > PNG_MAX_BUFFERED_PIXELS) {
+    LOG_ERR("PNG", "PNG row exceeds buffer limit: need %d bytes, max %d", requiredInternal, PNG_MAX_BUFFERED_PIXELS);
+    return false;
+  }
+#ifdef PNGDEC_CALLER_ROW_BUFFER
+  auto decoderRows = makeUniqueNoThrow<uint8_t[]>(requiredInternal);
+  if (!decoderRows) {
+    LOG_ERR("PNG", "Failed to allocate PNG decoder rows (%d bytes)", requiredInternal);
+    return false;
+  }
+  png->setRowBuffer(decoderRows.get(), requiredInternal);
+#endif
+
   // The converter expands each source row to 8-bit grayscale before dithering,
   // so this scratch buffer is sized by source pixels even when PNGdec reads a
   // packed 1/2/4-bit row internally.
-  constexpr size_t MAX_GRAY_LINE_BUFFER_BYTES = PNG_MAX_BUFFERED_PIXELS / 2;
   const size_t grayBufSize = static_cast<size_t>(ctx.srcWidth);
   if (grayBufSize > MAX_GRAY_LINE_BUFFER_BYTES) {
     LOG_ERR("PNG", "Expanded gray row too wide: need %u bytes for width=%d, max=%u", static_cast<unsigned>(grayBufSize),
@@ -463,10 +445,18 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // re-decode on every one of an image page's ~14 render passes.
   ctx.caching = !config.preserveAlpha && !config.cachePath.empty();
   if (ctx.caching) {
-    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1)) {
+    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1,
+                         PixelCacheLayout::Versioned, config.useBilinear)) {
+      if (config.cacheOnly) return false;
       LOG_ERR("PNG", "Failed to start cache stream, continuing without caching");
       ctx.caching = false;
     }
+  }
+
+  std::unique_ptr<uint8_t[]> previousLine;
+  if (config.useBilinear && !retainAlpha && (ctx.stepX > SAMPLE_ONE || ctx.stepY > SAMPLE_ONE)) {
+    previousLine = makeUniqueNoThrow<uint8_t[]>(grayBufSize);
+    ctx.previousGrayLine = previousLine.get();
   }
 
   unsigned long decodeStart = millis();
@@ -477,7 +467,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   ctx.grayLineBuffer = nullptr;
   ctx.alphaLineBuffer = nullptr;
 
-  if (ctx.aborted || rc != PNG_SUCCESS) {
+  if (ctx.aborted || ImageToFramebufferDecoder::isAborted() || rc != PNG_SUCCESS || ctx.lastDstY != ctx.dstHeight - 1) {
     if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
       LOG_DBG("PNG", "PNG decode aborted after %lu ms", decodeTime);
     } else {
@@ -490,11 +480,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   LOG_DBG("PNG", "PNG decoding complete - render time: %lu ms", decodeTime);
 
   // Finalize the streamed cache (caching may have been cleared on a flush error).
-  if (ctx.caching) {
-    ctx.cache.finalize();
-  }
-
-  return true;
+  const bool cacheWritten = ctx.caching && ctx.cache.finalize();
+  return !config.cacheOnly || cacheWritten;
 }
 
 bool PngToFramebufferConverter::supportsFormat(const std::string& extension) {

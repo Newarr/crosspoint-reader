@@ -8,6 +8,8 @@
 #include <cstring>
 #include <string>
 
+#include "PixelCacheFormat.h"
+
 // Streaming cache writer for 2-bit pixels (4 levels). Packs 4 pixels per byte,
 // MSB first.
 //
@@ -60,7 +62,9 @@ struct PixelCache {
 
   // Open the cache file, write the header, and allocate a band buffer big enough
   // to hold the tallest single decode block (maxBlockDstRows output rows).
-  bool begin(const std::string& cachePath, int w, int h, int ox, int oy, int maxBlockDstRows) {
+  bool begin(const std::string& cachePath, int w, int h, int ox, int oy, int maxBlockDstRows,
+             PixelCacheLayout layout = PixelCacheLayout::PackedRows, bool useBilinear = true) {
+    if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) return false;
     width = w;
     height = h;
     originX = ox;
@@ -81,7 +85,7 @@ struct PixelCache {
     // A single decode block must fit inside the band, otherwise streaming would
     // drop rows. This only fails for pathological upscales that could not be
     // cached at all; fall back to the no-cache path.
-    if (wantRows < maxBlockDstRows) {
+    if (wantRows < maxBlockDstRows && wantRows < h) {
       LOG_ERR("IMG", "Cache band too small (%d < %d rows) for %dx%d", wantRows, maxBlockDstRows, w, h);
       return false;
     }
@@ -104,9 +108,13 @@ struct PixelCache {
     }
     cachePathStr = cachePath;
 
-    uint16_t w16 = (uint16_t)w;
-    uint16_t h16 = (uint16_t)h;
-    if (file.write(&w16, 2) != 2 || file.write(&h16, 2) != 2) {
+    const PixelCacheHeader header{PXC_MAGIC, PXC_VERSION, static_cast<uint8_t>(useBilinear), static_cast<uint16_t>(w),
+                                  static_cast<uint16_t>(h)};
+    const bool headerWritten = layout == PixelCacheLayout::Versioned
+                                   ? file.write(&header, sizeof(header)) == sizeof(header)
+                                   : file.write(&header.width, sizeof(header.width)) == sizeof(header.width) &&
+                                         file.write(&header.height, sizeof(header.height)) == sizeof(header.height);
+    if (!headerWritten) {
       LOG_ERR("IMG", "Failed to write cache header: %s", cachePath.c_str());
       abort();
       return false;
@@ -161,8 +169,7 @@ struct PixelCache {
       abort();
       return false;
     }
-    LOG_DBG("IMG", "Cache written: %s (%dx%d, %d bytes)", cachePathStr.c_str(), width, height,
-            4 + bytesPerRow * height);
+    LOG_DBG("IMG", "Cache written: %s (%dx%d)", cachePathStr.c_str(), width, height);
     ok = false;  // file handed off; nothing left to clean up
     return true;
   }

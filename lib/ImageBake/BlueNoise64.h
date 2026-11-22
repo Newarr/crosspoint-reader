@@ -1,0 +1,24 @@
+#pragma once
+
+#include <stdint.h>
+
+namespace ttfimg {
+
+// The toroidal blue-noise threshold matrix, values 0..255, each used exactly
+// 16 times per 64x64 tile. Tiled at (x & 63, row & 63) — no seam at the
+// 64-pixel boundary.
+alignas(32) extern const uint8_t kBlueNoise64[64][64];
+
+// Linear-light quantizer LUT: entry = (k << 9) | thresh. k (bits 10:9) is the
+// base panel level (0..2), thresh (bits 8:0) the ordered-dither threshold
+// (0..256) for source gray = the entry index in linear light. The palette
+// anchors {0, 85, 170, 255} map to the solid levels {0, 1, 2, 3}.
+alignas(32) extern const uint16_t kBlueNoiseLinearLut[256];
+
+// Stateless per-pixel quantizer: tone = k + (noise < thresh).
+inline uint8_t blueNoiseQuantize(const uint8_t g, const uint8_t nz) noexcept {
+  const uint16_t entry = kBlueNoiseLinearLut[g];
+  return static_cast<uint8_t>((entry >> 9) + (static_cast<uint16_t>(nz) < (entry & 0x1FFu)));
+}
+
+}  // namespace ttfimg

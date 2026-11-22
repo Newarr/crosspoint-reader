@@ -16,6 +16,9 @@ class ImageBlock final : public Block {
 
   bool hasValidCache() const;
   bool needsDecode() const;
+  static void setBilinearScaling(bool enabled);
+  bool needsFramebufferLoanToDecode() const;
+  bool cacheImage(GfxRenderer& renderer, int x, int y);
   void renderPlaceholder(GfxRenderer& renderer, int x, int y) const;
   static void clearRenderFailures();
 
@@ -42,6 +45,8 @@ class ImageBlock final : public Block {
   static std::unique_ptr<ImageBlock> deserialize(HalFile& file);
 
  private:
+  bool decodeImage(GfxRenderer& renderer, int x, int y, bool cacheOnly);
+
   std::string imagePath;
   std::string srcPath;  // book-internal source href; empty once known-extracted
   int16_t width;
