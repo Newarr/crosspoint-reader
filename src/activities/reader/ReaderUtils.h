@@ -11,6 +11,7 @@
 
 #include "HapticFeedback.h"
 #include "MappedInputManager.h"
+#include "TurnNetting.h"
 #include "activities/ActivityManager.h"
 
 namespace ReaderUtils {
@@ -73,6 +74,25 @@ struct PageTurnResult {
   bool next;
   bool fromTilt;
 };
+
+inline turnnet::TriggerCounts countPageTurnTriggers(const MappedInputManager& input, bool& fromTilt) {
+  using Button = MappedInputManager::Button;
+  const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;
+  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
+  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
+  fromTilt = tiltPrev || tiltNext;
+  const auto frontButtons = getFrontPageTurnButtons(input);
+  const auto count = [&](const Button button) -> int {
+    if (usePress) return input.wasPressedCount(button);
+    if (input.wasLongPressed(button, SKIP_HOLD_MS)) return 1;
+    return input.wasReleasedCount(button);
+  };
+  const bool powerTurn =
+      SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN && input.wasPowerSingleClick();
+  const bool homeTurn = input.homeButtonAction() == HomeButtonAction::NextPage;
+  return {count(Button::PageForward) + count(frontButtons.next) + tiltNext + (powerTurn || homeTurn),
+          count(Button::PageBack) + count(frontButtons.previous) + tiltPrev};
+}
 
 inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;

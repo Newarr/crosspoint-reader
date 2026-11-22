@@ -15,6 +15,7 @@
 #include "ClipSelectionActivity.h"
 #include "EpubReaderMenuActivity.h"
 #include "LinkNoteTitle.h"
+#include "ManualPageTurnQueue.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
@@ -35,11 +36,13 @@ class EpubReaderActivity final : public ReaderActivity {
   std::optional<uint32_t> pendingOffsetJump;
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
-  std::atomic<int8_t> pendingManualTurn{0};
+  ManualPageTurnQueue manualPageTurns;
   std::atomic<bool> cancelRenderRequested{false};
   bool pendingManualTurnTouch = false;
+  bool pageWasSkimmed = false;
   bool shouldCancelRender() const;
   static bool shouldCancelRenderCallback(void* ctx);
+  bool pageTurnBy(int steps);
   bool pendingPercentJump = false;
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
@@ -60,24 +63,21 @@ class EpubReaderActivity final : public ReaderActivity {
   int idlePrewarmPage = -1;
   int idlePrewarmOffset = 0;
   unsigned long lastRenderCompleteMs = 0;
+  int lastRenderedSpine = -1;
   // Speculative next-page pre-render & controller DTM2 pre-load (0 ms render/SPI on forward turn).
-  bool preloadedNextPageValid = false;
-  int preloadedAttemptedSpine = -1;
-  int preloadedAttemptedPage = -1;
-  int preloadedSpineIndex = -1;
-  int preloadedPageNumber = -1;
-  uint8_t preloadedOrientation = 0;
-  int preloadedFontId = -1;
-  bool preloadedInverted = false;
+  std::optional<uint64_t> preloadedFingerprint;
+  bool stageAttempted = false;
+  uint32_t bookmarkRevision = 0;
   int preloadedMarginLeft = 0;
   int preloadedMarginTop = 0;
-  int64_t preloadedMinute = 0;
   std::optional<uint32_t> preloadedVisibleOffset;
   std::vector<FootnoteEntry> preloadedFootnotes;
   std::vector<PageLink> preloadedLinks;
   void clearPreloadedNextPage();
+  uint64_t stagedPageFingerprint(const ReaderRenderSpec& spec, int page, int top, int left) const;
   void computePageMargins(int& outTop, int& outRight, int& outBottom, int& outLeft) const;
   void stageNextPageIfIdle();
+  bool cacheImagesWithFramebufferLoan(const Page& page, int fontId, int left, int top);
   // Debounced SD progress persistence (eliminates 4-op exFAT write stall on every page turn).
   static constexpr unsigned long PROGRESS_SAVE_DEBOUNCE_MS = 1500;
   static constexpr unsigned long PROGRESS_SAVE_MAX_DELAY_MS = 15000;
@@ -93,15 +93,19 @@ class EpubReaderActivity final : public ReaderActivity {
   // Progressive B/W-first image pages: show B/W immediately and run 4-level grayscale
   // upgrade only if the reader pauses on the image for ~250 ms (still abortable per strip).
   bool deferredImageGrayPending = false;
+  bool pageGrayOverlayActive = false;
   int deferredImageGraySpine = -1;
   int deferredImageGrayPage = -1;
   int deferredImageGrayTop = 0;
-  int deferredImageGrayRight = 0;
-  int deferredImageGrayBottom = 0;
   int deferredImageGrayLeft = 0;
   unsigned long deferredImageGrayReadyAtMs = 0;
   void clearDeferredImageGray();
   bool deferredImageGrayTick();
+  static constexpr int GRAYSCALE_STRIP_ROWS = 80;
+  std::unique_ptr<uint8_t[]> grayscaleStripScratch;
+  size_t grayscaleStripScratchBytes = 0;
+  uint8_t* getGrayscaleStripScratch(size_t bytes);
+  void releaseGrayscaleStripScratch();
   // Background next-chapter section pre-build on the final 2 pages of a chapter.
   std::unique_ptr<Section> nextChapterSection;
   int nextChapterSpineIndex = -1;
@@ -176,7 +180,11 @@ class EpubReaderActivity final : public ReaderActivity {
 
   uint16_t buildViewportWidth = 0;
   uint16_t buildViewportHeight = 0;
-  bool partialRebuildStartFailed = false;
+  bool deferPartialBuildUntilNeeded = false;
+  bool embeddedStyleDisabledForBook = false;
+  ReaderRenderSpec makeRenderSpec(uint16_t width, uint16_t height) const;
+  enum class SectionRenderResult { Ready, BuildFailed, RadioBusy };
+  SectionRenderResult prepareSectionForRender(const ReaderRenderSpec& spec);
 
   int lastSavedSpineIndex = -1;
   int lastSavedPage = -1;
@@ -191,8 +199,9 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 16 * 1024;
   // Requires the render lock; heap admission is checked separately by the build tick.
   bool backgroundBuildWanted() const;
-  bool buildTickHeapGate();
-  bool buildHeapPaused = false;
+  enum class BuildHeapGate { Ready, Waiting, Suspended };
+  BuildHeapGate buildTickHeapGate(Section& building);
+  std::optional<unsigned long> buildHeapPausedSinceMs;
   // One bounded build step on the loop task, in a frame whose input did nothing. Lays out about
   // BACKGROUND_BUILD_PAGES_PER_TICK pages (one 1 KB parse step may add more) and hands the loop
   // back as soon as a button is down, so a short press is seen before more pages are built.
@@ -274,8 +283,7 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
-  bool renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
-                      int orientedMarginBottom, int orientedMarginLeft);
+  bool renderContents(const Page& page, int orientedMarginTop, int orientedMarginLeft, bool skimPage);
   void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
