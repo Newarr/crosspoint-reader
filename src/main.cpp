@@ -1045,6 +1045,8 @@ void loop() {
       String cmd = line.substring(4);
       cmd.trim();
       if (cmd == "SCREENSHOT") {
+        RenderLock lock;
+        activityManager.ensureFreshFrameBuffer();
         const uint32_t bufferSize = display.getBufferSize();
         logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
         uint8_t* buf = display.getFrameBuffer();
@@ -1075,6 +1077,7 @@ void loop() {
       mappedInputManager.consumePowerGesture();
       {
         RenderLock lock;
+        activityManager.ensureFreshFrameBuffer();
         ScreenshotUtil::takeScreenshot(renderer);
       }
     }
@@ -1189,7 +1192,7 @@ void loop() {
     RenderLock lock(RenderLock::Mode::Try);
     if (!lock.ownsLock()) {
       // Let rendering advance without treating lock contention as idle.
-      delay(10);
+      delay(activityManager.isReaderActivity() ? 4 : 10);
       return;
     }
     skipLoopDelay = activityManager.skipLoopDelay();
@@ -1206,16 +1209,29 @@ void loop() {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
       // Sleep in short slices and wake the poll as soon as a button contact closes.
-      // InputManager commits a press only when two consecutive polls agree, so a
-      // press shorter than one 50 ms sleep could land in a single sample and be lost.
+      // InputManager commits a press only when two consecutive polls agree (>5 ms),
+      // so ramping CPU back to full speed immediately on raw contact cuts idle-wake
+      // page-turn latency from ~25-35 ms down to ~8-10 ms.
       const unsigned long idleStart = millis();
+      const uint32_t sliceMs = activityManager.isReaderActivity() ? 5 : 10;
+      bool wokeOnInput = false;
       while (millis() - idleStart < 50) {
-        delay(10);
-        if (gpio.rawInputActive()) break;
+        delay(sliceMs);
+        if (gpio.rawInputActive()) {
+          wokeOnInput = true;
+          break;
+        }
+      }
+      if (wokeOnInput) {
+        powerManager.setPowerSaving(false);
+        lastActivityTime = millis();
       }
     } else {
-      // Short delay to prevent tight loop while still being responsive
-      delay(10);
+      // Short delay to prevent tight loop while still being responsive (3 ms when
+      // button contact is active so 5 ms debounce commits in 2 ticks, 4 ms reading).
+      const uint32_t activeDelayMs =
+          activityManager.isReaderActivity() ? (gpio.rawInputActive() ? 3 : 4) : 10;
+      delay(activeDelayMs);
     }
   }
 }

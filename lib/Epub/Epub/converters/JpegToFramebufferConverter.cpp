@@ -49,6 +49,7 @@ struct JpegContext {
 
   PixelCache cache;
   bool caching{false};
+  bool aborted{false};
 
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
 };
@@ -107,15 +108,15 @@ constexpr size_t MIN_FREE_HEAP_FOR_JPEG = JPEG_DECODER_APPROX_SIZE + 16 * 1024;
 // Choose JPEGDEC's built-in scale factor for coarse downscaling.
 // Returns the scale denominator (1, 2, 4, or 8) and sets jpegScaleOption.
 int chooseJpegScale(float targetScale, int& jpegScaleOption) {
-  if (targetScale <= 0.125f) {
+  if (targetScale <= 0.135f) {
     jpegScaleOption = JPEG_SCALE_EIGHTH;
     return 8;
   }
-  if (targetScale <= 0.25f) {
+  if (targetScale <= 0.27f) {
     jpegScaleOption = JPEG_SCALE_QUARTER;
     return 4;
   }
-  if (targetScale <= 0.5f) {
+  if (targetScale <= 0.54f) {
     jpegScaleOption = JPEG_SCALE_HALF;
     return 2;
   }
@@ -131,8 +132,16 @@ constexpr int32_t FP_MASK = FP_ONE - 1;
 int jpegDrawCallback(JPEGDRAW* pDraw) {
   JpegContext* ctx = reinterpret_cast<JpegContext*>(pDraw->pUser);
   if (!ctx || !ctx->config || !ctx->renderer) return 0;
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    return 0;
+  }
 
   ImageToFramebufferDecoder::yieldDuringDecode(ctx->lastYieldMs);
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    return 0;
+  }
 
   // In EIGHT_BIT_GRAYSCALE mode, pPixels contains 8-bit grayscale values
   // Buffer is densely packed: stride = pDraw->iWidth, valid columns = pDraw->iWidthUsed
@@ -521,8 +530,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   rc = jpeg->decode(0, 0, jpegScaleOption);
   unsigned long decodeTime = millis() - decodeStart;
 
-  if (rc != 1) {
-    LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
+  // JPEGDEC returns 1 even when jpegDrawCallback returns 0 to stop early, so
+  // check the latched ctx.aborted flag before finalizing the streamed cache.
+  if (ctx.aborted || rc != 1) {
+    if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
+      LOG_DBG("JPG", "JPEG decode aborted after %lu ms", decodeTime);
+    } else {
+      LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
+    }
     if (ctx.caching) ctx.cache.abort();
     return false;
   }

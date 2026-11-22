@@ -143,6 +143,10 @@ bool loadPxcSlot(uint64_t cacheHash, HalFile& cacheFile, uint16_t cachedWidth, u
     return false;
   }
   for (size_t i = 0; i < chunkCount; i++) {
+    if (ImageToFramebufferDecoder::isAborted()) {
+      releasePxcSlot();
+      return false;
+    }
     const size_t want = remaining < PXC_CHUNK_SIZE ? remaining : PXC_CHUNK_SIZE;
     if (ESP.getFreeHeap() < remaining + PXC_HEAP_RESERVE || ESP.getMaxAllocHeap() < want + PXC_MAX_ALLOC_RESERVE) {
       releasePxcSlot();
@@ -169,6 +173,7 @@ void renderRowsFromPxcSlot(GfxRenderer& renderer, int x, int y) {
   pw.init(renderer);
 
   for (int row = 0; row < pxcSlotHeight; row++) {
+    if ((row & 31) == 0 && ImageToFramebufferDecoder::isAborted()) return;
     const uint8_t* rowBuffer = pxcRowPtr((size_t)row * bytesPerRow, bytesPerRow, tempRow);
     pw.beginRow(y + row);
     int colStart, colEnd;
@@ -249,6 +254,10 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
   int bufferRow = 0;
   for (int row = 0; row < cachedHeight; row++) {
     if (bufferRow >= rowsInBuffer) {
+      if (ImageToFramebufferDecoder::isAborted()) {
+        free(readBuffer);
+        return false;
+      }
       const int toRead = (cachedHeight - row < rowsPerRead) ? (cachedHeight - row) : rowsPerRead;
       const size_t bytes = (size_t)toRead * bytesPerRow;
       if (cacheFile.read(readBuffer, bytes) != static_cast<int>(bytes)) {
@@ -317,6 +326,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   // passes; on first view this just moves the one-time decode to the BW pass.
   FontCacheManager* fcm = renderer.getFontCacheManager();
   if (fcm && fcm->isScanning()) return;
+  if (ImageToFramebufferDecoder::isAborted()) return;
 
   LOG_DBG("IMG", "Rendering image at %d,%d: %s (%dx%d)", x, y, imagePath.c_str(), width, height);
 
@@ -348,18 +358,23 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   // Try to render from cache first
   std::string cachePath = getCachePath(imagePath);
   if (renderFromCache(renderer, cachePath, x, y, width, height)) {
-    renderer.preserveImagePolarity(x, y, width, height);
+    if (!ImageToFramebufferDecoder::isAborted()) {
+      renderer.preserveImagePolarity(x, y, width, height);
+    }
     return;  // Successfully rendered from cache
   }
+  if (ImageToFramebufferDecoder::isAborted()) return;
 
   // The build only header-probed the image for dimensions; pull the actual
   // file out of the book now, on first visit to the page.
   if (!srcPath.empty() && extractFn && !Storage.exists(imagePath.c_str())) {
     LOG_DBG("IMG", "Lazy-extracting %s -> %s", srcPath.c_str(), imagePath.c_str());
     if (!extractFn(extractCtx, srcPath.c_str(), imagePath.c_str())) {
+      if (ImageToFramebufferDecoder::isAborted()) return;
       LOG_ERR("IMG", "Lazy extraction failed: %s", srcPath.c_str());
     }
   }
+  if (ImageToFramebufferDecoder::isAborted()) return;
 
   // No cache - need to decode the image
   // Check if image file exists
@@ -405,6 +420,9 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
 
   bool success = decoder->decodeToFramebuffer(imagePath, renderer, config);
   if (!success) {
+    if (ImageToFramebufferDecoder::isAborted()) {
+      return;
+    }
     LOG_ERR("IMG", "Failed to decode image: %s", imagePath.c_str());
     rememberImageFailure(imagePath);
     renderPlaceholder(renderer, x, y);

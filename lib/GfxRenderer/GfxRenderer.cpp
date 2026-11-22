@@ -1863,6 +1863,20 @@ void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
   display.displayBuffer(refreshMode, fadingFix);
 }
 
+bool GfxRenderer::canStageNextFrame() const {
+  return !fadingFix && !promotedRefreshPending_ && display.canStageNextFrame();
+}
+
+bool GfxRenderer::stageNextFrame() const {
+  if (!canStageNextFrame()) return false;
+  return display.stageNextFrame();
+}
+
+bool GfxRenderer::triggerStagedFastRefresh() const {
+  if (!canStageNextFrame()) return false;
+  return display.triggerStagedFastRefresh(fadingFix);
+}
+
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
   refreshMode = applyPromotedRefresh(refreshMode);
   // The async path has no turn-off-screen hook, which the sunlight fading fix

@@ -41,6 +41,7 @@ struct PngContext {
   int lastDstY{-1};  // Track last rendered destination Y to avoid duplicates
   PixelCache cache;
   bool caching{false};
+  bool aborted{false};
 
   uint8_t* grayLineBuffer{nullptr};
   uint8_t* alphaLineBuffer{nullptr};
@@ -215,8 +216,16 @@ void convertLineToGray(const uint8_t* pPixels, uint8_t* grayLine, int width, int
 int pngDrawCallback(PNGDRAW* pDraw) {
   PngContext* ctx = reinterpret_cast<PngContext*>(pDraw->pUser);
   if (!ctx || !ctx->config || !ctx->renderer || !ctx->grayLineBuffer) return 0;
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    return 0;
+  }
 
   ImageToFramebufferDecoder::yieldDuringDecode(ctx->lastYieldMs);
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    return 0;
+  }
 
   int srcY = pDraw->y;
   int srcWidth = ctx->srcWidth;
@@ -468,8 +477,12 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   ctx.grayLineBuffer = nullptr;
   ctx.alphaLineBuffer = nullptr;
 
-  if (rc != PNG_SUCCESS) {
-    LOG_ERR("PNG", "Decode failed: %d", rc);
+  if (ctx.aborted || rc != PNG_SUCCESS) {
+    if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
+      LOG_DBG("PNG", "PNG decode aborted after %lu ms", decodeTime);
+    } else {
+      LOG_ERR("PNG", "Decode failed: %d", rc);
+    }
     if (ctx.caching) ctx.cache.abort();
     return false;
   }

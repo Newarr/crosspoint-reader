@@ -60,6 +60,9 @@ class HalDisplay {
                  bool fromProgmem = false) const;
 
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  bool canStageNextFrame() const;
+  bool stageNextFrame();
+  bool triggerStagedFastRefresh(bool turnOffScreen = false);
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
   // until waitRefreshComplete(), and the caller must rebuild the differential

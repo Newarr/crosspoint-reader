@@ -2,6 +2,14 @@
 
 #include <Arduino.h>
 #include <Logging.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+
+namespace {
+portMUX_TYPE s_abortMux = portMUX_INITIALIZER_UNLOCKED;
+ImageToFramebufferDecoder::AbortFn s_abortFn = nullptr;
+void* s_abortCtx = nullptr;
+}  // namespace
 
 bool ImageToFramebufferDecoder::validateAndStoreDimensions(const int64_t width, const int64_t height,
                                                            ImageDimensions& out, const char* format) {
@@ -32,10 +40,32 @@ bool ImageToFramebufferDecoder::validateAndStoreDimensions(const int64_t width, 
 
 void ImageToFramebufferDecoder::yieldDuringDecode(uint32_t& lastYieldMs) {
   const uint32_t now = millis();
-  if (now - lastYieldMs >= 250) {
+  if (now - lastYieldMs >= 12) {
     lastYieldMs = now;
     vTaskDelay(1);
   }
+}
+
+void ImageToFramebufferDecoder::setAbortCheck(void* ctx, AbortFn fn) {
+  portENTER_CRITICAL(&s_abortMux);
+  s_abortCtx = ctx;
+  s_abortFn = fn;
+  portEXIT_CRITICAL(&s_abortMux);
+}
+
+void ImageToFramebufferDecoder::getAbortCheck(void*& ctx, AbortFn& fn) {
+  portENTER_CRITICAL(&s_abortMux);
+  ctx = s_abortCtx;
+  fn = s_abortFn;
+  portEXIT_CRITICAL(&s_abortMux);
+}
+
+bool ImageToFramebufferDecoder::isAborted() {
+  portENTER_CRITICAL(&s_abortMux);
+  const AbortFn fn = s_abortFn;
+  void* const ctx = s_abortCtx;
+  portEXIT_CRITICAL(&s_abortMux);
+  return fn != nullptr && fn(ctx);
 }
 
 void ImageToFramebufferDecoder::warnUnsupportedFeature(const std::string& feature, const std::string& imagePath) {

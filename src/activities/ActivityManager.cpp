@@ -470,6 +470,12 @@ ScreenshotInfo ActivityManager::getScreenshotInfo() const {
   return {};
 }
 
+void ActivityManager::ensureFreshFrameBuffer() {
+  if (currentActivity) {
+    currentActivity->ensureFreshFrameBuffer();
+  }
+}
+
 void ActivityManager::prepareForSleep() {
   RenderLock lock;
   for (const auto& activity : stackActivities) activity->prepareForSleep();

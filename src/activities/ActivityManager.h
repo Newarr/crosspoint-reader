@@ -124,6 +124,7 @@ class ActivityManager {
   bool handleForcedRefresh();
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;
+  void ensureFreshFrameBuffer();
   void prepareForSleep();
 
   // If immediate is true, the update will be triggered immediately.

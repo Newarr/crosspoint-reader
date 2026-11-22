@@ -36,10 +36,17 @@ class ImageToFramebufferDecoder {
   virtual const char* getFormatName() const = 0;
 
   // Call from per-row/per-MCU decode callbacks (free functions, hence public):
-  // yields one tick at most every 250 ms so multi-second decodes keep the idle
-  // task (and its watchdog) fed. `lastYieldMs` is caller-held state,
-  // initialized to the decode start time.
+  // yields one tick every ~12 ms so multi-second decodes keep the input loop
+  // responsive and the idle task watchdog fed. `lastYieldMs` is caller-held
+  // state, initialized to the decode start time.
   static void yieldDuringDecode(uint32_t& lastYieldMs);
+
+  // Cooperative abort hook for long image extraction/decoding passes (e.g.
+  // user pressed Next/Prev Page while an image page is still loading).
+  using AbortFn = bool (*)(void* ctx);
+  static void setAbortCheck(void* ctx, AbortFn fn);
+  static void getAbortCheck(void*& ctx, AbortFn& fn);
+  static bool isAborted();
 
   // Validate decoder/header dimensions before narrowing them into the layout
   // representation. Shared by header probing and decoder fallbacks.

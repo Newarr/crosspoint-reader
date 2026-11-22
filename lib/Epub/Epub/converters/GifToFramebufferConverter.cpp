@@ -37,6 +37,7 @@ struct GifContext {
   PixelCache cache;
   bool caching{false};
   bool success{true};
+  bool aborted{false};
   uint32_t lastYieldMs{0};
 };
 
@@ -182,8 +183,18 @@ int32_t gifSeekWithHandle(GIFFILE* pFile, int32_t position) {
 void gifDrawCallback(GIFDRAW* pDraw) {
   auto* ctx = reinterpret_cast<GifContext*>(pDraw->pUser);
   if (!ctx || !ctx->success || !ctx->grayRow || !ctx->whiteRow) return;
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    ctx->success = false;
+    return;
+  }
 
   ImageToFramebufferDecoder::yieldDuringDecode(ctx->lastYieldMs);
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx->aborted = true;
+    ctx->success = false;
+    return;
+  }
 
   const int canvasY = pDraw->iY + pDraw->y;
   if (canvasY < 0 || canvasY >= ctx->srcHeight) {
@@ -339,8 +350,13 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   int delayMs = 0;
   ctx.lastYieldMs = millis();
   const int frameState = gif->playFrame(false, &delayMs, &ctx);
-  if (!ctx.success || (gif->getLastError() != GIF_SUCCESS && gif->getLastError() != GIF_EMPTY_FRAME)) {
-    LOG_ERR("GIF", "GIF decode failed (state=%d, err=%d)", frameState, gif->getLastError());
+  if (ctx.aborted || !ctx.success ||
+      (gif->getLastError() != GIF_SUCCESS && gif->getLastError() != GIF_EMPTY_FRAME)) {
+    if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
+      LOG_DBG("GIF", "GIF decode aborted");
+    } else {
+      LOG_ERR("GIF", "GIF decode failed (state=%d, err=%d)", frameState, gif->getLastError());
+    }
     if (ctx.caching) ctx.cache.abort();
     return false;
   }

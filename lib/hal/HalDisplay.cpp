@@ -62,6 +62,14 @@ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen)
   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
 }
 
+bool HalDisplay::canStageNextFrame() const { return einkDisplay.canStageNextFrame(); }
+
+bool HalDisplay::stageNextFrame() { return einkDisplay.stageNextFrame(); }
+
+bool HalDisplay::triggerStagedFastRefresh(bool turnOffScreen) {
+  return einkDisplay.triggerStagedFastRefresh(turnOffScreen);
+}
+
 void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);

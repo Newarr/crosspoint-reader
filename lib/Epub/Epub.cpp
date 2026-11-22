@@ -20,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/parsers/ContainerParser.h"
 #include "Epub/parsers/ContentOpfParser.h"
 #include "Epub/parsers/TocNavParser.h"
@@ -1145,17 +1146,54 @@ bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, con
 }
 
 bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath) const {
-  HalFile out;
-  if (!Storage.openFileForWrite("EBP", destPath, out)) {
+  if (ImageToFramebufferDecoder::isAborted()) {
     return false;
   }
+  const std::string tmpPath = destPath + ".tmp";
+  HalFile out;
+  if (!Storage.openFileForWrite("EBP", tmpPath, out)) {
+    return false;
+  }
+  class AbortingFilePrint final : public Print {
+    HalFile& file;
+    uint32_t lastYieldMs;
+    bool aborted = false;
+    bool writeFailed = false;
+
+   public:
+    explicit AbortingFilePrint(HalFile& f) : file(f), lastYieldMs(millis()) {}
+    bool wasAborted() const { return aborted; }
+    bool hasWriteError() const { return writeFailed; }
+    size_t write(uint8_t b) override { return write(&b, 1); }
+    size_t write(const uint8_t* buf, size_t size) override {
+      if (ImageToFramebufferDecoder::isAborted()) {
+        aborted = true;
+        return 0;
+      }
+      ImageToFramebufferDecoder::yieldDuringDecode(lastYieldMs);
+      if (ImageToFramebufferDecoder::isAborted()) {
+        aborted = true;
+        return 0;
+      }
+      const size_t written = file.write(buf, size);
+      if (written != size) {
+        writeFailed = true;
+      }
+      return written;
+    }
+  };
+  AbortingFilePrint sink(out);
   // Large images dominate lazy extraction. Match the section streamer size to
   // halve SD read/write calls while adding only 8 KB of transient ZIP buffers.
-  const bool ok = readItemContentsToStream(itemHref, out, 8192);
+  const bool streamOk = readItemContentsToStream(itemHref, sink, 8192, /*allowEarlyStop=*/true);
   out.flush();
-  out.close();
+  const bool closedOk = out.close();
+  bool ok = streamOk && !sink.wasAborted() && !sink.hasWriteError() && closedOk;
+  if (ok) {
+    ok = Storage.replaceFile(tmpPath.c_str(), destPath.c_str());
+  }
   if (!ok) {
-    Storage.remove(destPath.c_str());
+    Storage.remove(tmpPath.c_str());
   }
   return ok;
 }

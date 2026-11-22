@@ -35,8 +35,11 @@ class EpubReaderActivity final : public ReaderActivity {
   std::optional<uint32_t> pendingOffsetJump;
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
-  int8_t pendingManualTurn = 0;
+  std::atomic<int8_t> pendingManualTurn{0};
+  std::atomic<bool> cancelRenderRequested{false};
   bool pendingManualTurnTouch = false;
+  bool shouldCancelRender() const;
+  static bool shouldCancelRenderCallback(void* ctx);
   bool pendingPercentJump = false;
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
@@ -57,6 +60,55 @@ class EpubReaderActivity final : public ReaderActivity {
   int idlePrewarmPage = -1;
   int idlePrewarmOffset = 0;
   unsigned long lastRenderCompleteMs = 0;
+  // Speculative next-page pre-render & controller DTM2 pre-load (0 ms render/SPI on forward turn).
+  bool preloadedNextPageValid = false;
+  int preloadedAttemptedSpine = -1;
+  int preloadedAttemptedPage = -1;
+  int preloadedSpineIndex = -1;
+  int preloadedPageNumber = -1;
+  uint8_t preloadedOrientation = 0;
+  int preloadedFontId = -1;
+  bool preloadedInverted = false;
+  int preloadedMarginLeft = 0;
+  int preloadedMarginTop = 0;
+  int64_t preloadedMinute = 0;
+  std::optional<uint32_t> preloadedVisibleOffset;
+  std::vector<FootnoteEntry> preloadedFootnotes;
+  std::vector<PageLink> preloadedLinks;
+  void clearPreloadedNextPage();
+  void computePageMargins(int& outTop, int& outRight, int& outBottom, int& outLeft) const;
+  void stageNextPageIfIdle();
+  // Debounced SD progress persistence (eliminates 4-op exFAT write stall on every page turn).
+  static constexpr unsigned long PROGRESS_SAVE_DEBOUNCE_MS = 1500;
+  static constexpr unsigned long PROGRESS_SAVE_MAX_DELAY_MS = 15000;
+  bool progressDirty = false;
+  unsigned long progressDirtySinceMs = 0;
+  unsigned long progressFirstDirtyMs = 0;
+  int pendingSaveSpine = -1;
+  int pendingSavePage = -1;
+  int pendingSavePageCount = -1;
+  std::optional<uint32_t> pendingSaveVisibleOffset;
+  void markProgressDirty(int spineIndex, int currentPage, int pageCount);
+  void flushPendingProgress(bool force = false);
+  // Progressive B/W-first image pages: show B/W immediately and run 4-level grayscale
+  // upgrade only if the reader pauses on the image for ~250 ms (still abortable per strip).
+  bool deferredImageGrayPending = false;
+  int deferredImageGraySpine = -1;
+  int deferredImageGrayPage = -1;
+  int deferredImageGrayTop = 0;
+  int deferredImageGrayRight = 0;
+  int deferredImageGrayBottom = 0;
+  int deferredImageGrayLeft = 0;
+  unsigned long deferredImageGrayReadyAtMs = 0;
+  void clearDeferredImageGray();
+  bool deferredImageGrayTick();
+  // Background next-chapter section pre-build on the final 2 pages of a chapter.
+  std::unique_ptr<Section> nextChapterSection;
+  int nextChapterSpineIndex = -1;
+  int nextChapterFailedSpine = -1;
+  uint32_t nextChapterSpecSig = 0;
+  void clearNextChapterPrebuild();
+  bool prebuildNextChapterTick();
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
   bool recentsEntryRemoved = false;
@@ -222,7 +274,7 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
-  void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
+  bool renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
   void renderStatusBar() const;
@@ -261,7 +313,9 @@ class EpubReaderActivity final : public ReaderActivity {
   ~EpubReaderActivity() override;
 
   void loop() override;
+  void onExit() override;
   void prepareForSleep() override;
+  void ensureFreshFrameBuffer() override;
   void render(RenderLock&& lock) override;
 
   bool pageTurn(bool isForward) override;

@@ -55,6 +55,9 @@ class Activity {
   virtual bool isHomeActivity() const { return false; }
   virtual bool handleHomeGesture() { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
+  // Caller holds RenderLock. Re-renders the visible screen into the framebuffer
+  // if speculative background work left it stale (e.g. next-page staging).
+  virtual void ensureFreshFrameBuffer() {}
 
   // Start a new activity without destroying the current one
   // Note: requestUpdate() will be invoked automatically once resultHandler finishes
