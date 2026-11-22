@@ -22,7 +22,7 @@ class ReaderActivity : public Activity {
   ReaderSession readerSession;
   std::atomic<bool> pageRendered{false};
   bool bookRemembered = false;
-  void markPageRendered() { pageRendered.store(true, std::memory_order_release); }
+  void markPageRendered();
   void rememberBookOnceRendered();
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -80,6 +80,7 @@ class ReaderActivity : public Activity {
   void onEnter() override;
   void onExit() override;
   void prepareForSleep() override;
+  bool supportsStandbyResume() const override { return true; }
   void loop() override;
   void render(RenderLock&& lock) override;
 

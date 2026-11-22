@@ -28,8 +28,6 @@ void ImageBlock::setExtractor(void* ctx, ExtractFn fn) {
 
 namespace {
 
-bool bilinearScaling = true;
-
 std::string getCachePath(const std::string& imagePath) {
   // Replace extension with .pxc (pixel cache)
   size_t dotPos = imagePath.rfind('.');
@@ -43,9 +41,7 @@ std::string getCachePath(const std::string& imagePath) {
 bool readValidCacheHeader(HalFile& cacheFile, const int expectedWidth, const int expectedHeight, uint16_t& cachedWidth,
                           uint16_t& cachedHeight) {
   PixelCacheHeader header;
-  if (cacheFile.read(&header, sizeof(header)) != sizeof(header) || header.magic != PXC_MAGIC ||
-      header.version != PXC_VERSION || header.bilinearRequested != static_cast<uint8_t>(bilinearScaling) ||
-      header.width == 0 || header.height == 0) {
+  if (cacheFile.read(&header, sizeof(header)) != sizeof(header) || !header.isValid()) {
     return false;
   }
 
@@ -183,8 +179,6 @@ const bool* drawByteTable(const DirectPixelWriter& writer) {
 }
 
 void drawPxcRow(DirectPixelWriter& writer, const bool* drawByte, const uint8_t* data, int x, int y, int width) {
-  if (writer.ditherBw && writer.mode != GfxRenderer::BW) return;
-
   writer.beginRow(y);
   int colStart, colEnd;
   writer.bandColRange(x, width, colStart, colEnd);
@@ -290,16 +284,8 @@ bool ImageBlock::hasValidCache() const {
 
 bool ImageBlock::needsDecode() const { return !imageFailedThisRender(imagePath) && !hasValidCache(); }
 
-void ImageBlock::setBilinearScaling(bool enabled) {
-  if (bilinearScaling == enabled) return;
-  bilinearScaling = enabled;
-  releasePxcSlot();
-}
-
 bool ImageBlock::needsFramebufferLoanToDecode() const {
-  constexpr size_t inflateWindowBytes = 32 * 1024;
-  const bool extractionNeedsLoan =
-      !srcPath.empty() && extractFn && ESP.getMaxAllocHeap() < inflateWindowBytes && !Storage.exists(imagePath.c_str());
+  const bool extractionNeedsLoan = !srcPath.empty() && extractFn && !Storage.exists(imagePath.c_str());
   return (extractionNeedsLoan || ImageDecoderFactory::decoderNeedsMoreHeap(imagePath)) && needsDecode();
 }
 
@@ -360,6 +346,8 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
     return;
   }
 
+  if (renderer.imagesDitheredInBw() && renderer.getRenderMode() != GfxRenderer::BW) return;
+
   // Try to render from cache first
   const auto cached = renderFromCache(renderer, getCachePath(imagePath), x, y, width, height);
   if (cached == CacheRenderResult::Aborted) return;
@@ -401,7 +389,6 @@ bool ImageBlock::decodeImage(GfxRenderer& renderer, int x, int y, bool cacheOnly
   config.maxHeight = height;
   config.useExactDimensions = true;
   config.cacheOnly = cacheOnly;
-  config.useBilinear = bilinearScaling;
   config.cachePath = getCachePath(imagePath);
   return decoder->decodeToFramebuffer(imagePath, renderer, config);
 }

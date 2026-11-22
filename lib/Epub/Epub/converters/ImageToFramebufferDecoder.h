@@ -23,7 +23,6 @@ struct RenderConfig {
   float sourceCropY = 0.0f;         // Fraction cropped equally from the top and bottom edges
   bool preserveAlpha = false;       // Skip transparent pixels instead of compositing them against white
   bool cacheOnly = false;
-  bool useBilinear = true;
   std::string cachePath;  // If non-empty, decoder will write pixel cache to this path
 };
 
@@ -34,8 +33,6 @@ class ImageToFramebufferDecoder {
   virtual bool decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config) = 0;
 
   virtual bool getDimensions(const std::string& imagePath, ImageDimensions& dims) const = 0;
-
-  virtual const char* getFormatName() const = 0;
 
   // Call from per-row/per-MCU decode callbacks (free functions, hence public):
   // yields one tick every ~12 ms so multi-second decodes keep the input loop

@@ -113,13 +113,11 @@ def create_grayscale_test_image(filename, is_png=True):
     start_y = 65
     gap = 10
 
-    # Gray levels chosen to avoid Bayer dithering threshold boundaries (±40 dither offset)
-    # Thresholds at 64, 128, 192 - use values in the middle of each band for solid output
-    # Safe zones: 0-23 (black), 88-103 (dark gray), 152-167 (light gray), 232-255 (white)
+    # Blue noise keeps these four levels solid and mixes adjacent shades between them.
     levels = [
         (0, "Level 0: BLACK"),
-        (96, "Level 1: DARK GRAY"),
-        (160, "Level 2: LIGHT GRAY"),
+        (85, "Level 1: DARK GRAY"),
+        (170, "Level 2: LIGHT GRAY"),
         (255, "Level 3: WHITE"),
     ]
 
@@ -371,7 +369,7 @@ def create_cache_test_image(filename, page_num, is_png=True):
 
 def create_gradient_test_image(filename, is_png=True):
     """
-    Create horizontal gradient to test grayscale banding.
+    Create gradients to show mixtures of adjacent gray levels.
     """
     width, height = 400, 500
     img = Image.new('L', (width, height), 255)
@@ -380,7 +378,7 @@ def create_gradient_test_image(filename, is_png=True):
     font_small = get_font(14)
 
     draw_text_centered(draw, 10, "GRADIENT TEST", font, fill=0)
-    draw_text_centered(draw, 35, "Smooth gradient → 4 bands expected", font_small, fill=64)
+    draw_text_centered(draw, 35, "Intermediate tones mix adjacent shades", font_small, fill=64)
 
     # Horizontal gradient
     gradient_y = 70
@@ -397,9 +395,8 @@ def create_gradient_test_image(filename, is_png=True):
     draw.text((5, y), "BLACK", font=font_small, fill=0)
     draw.text((width - 50, y), "WHITE", font=font_small, fill=0)
 
-    # 4-step gradient (what it should look like)
     y = 220
-    draw_text_centered(draw, y, "Expected result (4 distinct bands):", font_small, fill=0)
+    draw_text_centered(draw, y, "Solid levels (0, 85, 170, 255):", font_small, fill=0)
 
     band_y = y + 25
     band_height = 60
@@ -422,8 +419,8 @@ def create_gradient_test_image(filename, is_png=True):
 
     # Pass/fail
     y = height - 50
-    draw_text_centered(draw, y, "PASS: Clear 4-band quantization", font_small, fill=0)
-    draw_text_centered(draw, y + 20, "FAIL: Binary/noisy dithering", font_small, fill=64)
+    draw_text_centered(draw, y, "PASS: Four solid levels and smooth gradients", font_small, fill=0)
+    draw_text_centered(draw, y + 20, "FAIL: Hard bands in the gradients", font_small, fill=64)
 
     if is_png:
         img.save(filename, 'PNG')
@@ -605,11 +602,12 @@ def main():
 <p>If the image above is visible, JPEG decoding works.</p>
 """), single_image_asset(JPEG_FORMAT_JPG, images)),
             ("2. Grayscale", make_chapter("Grayscale Test", f"""
-<p>Verify 4 distinct gray levels are visible.</p>
+<p>Set <strong>Images</strong> to <strong>Display</strong> and check for four solid shades.</p>
 <img src="{image_src(GRAYSCALE_TEST_JPG)}" alt="Grayscale test"/>
 """), single_image_asset(GRAYSCALE_TEST_JPG, images)),
             ("3. Gradient", make_chapter("Gradient Test", f"""
-<p>Verify gradient quantizes to 4 bands.</p>
+<p>Set <strong>Images</strong> to <strong>Display</strong>.</p>
+<p>Check for four solid levels and mixtures of adjacent shades in the gradients.</p>
 <img src="{image_src(GRADIENT_TEST_JPG)}" alt="Gradient test"/>
 """), single_image_asset(GRADIENT_TEST_JPG, images)),
             ("4. Centering", make_chapter("Centering Test", f"""
@@ -670,11 +668,12 @@ def main():
 <p>If the image above is visible and no crash occurred, PNG decoding works.</p>
 """), single_image_asset(PNG_FORMAT_PNG, images)),
             ("2. Grayscale", make_chapter("Grayscale Test", f"""
-<p>Verify 4 distinct gray levels are visible.</p>
+<p>Set <strong>Images</strong> to <strong>Display</strong> and check for four solid shades.</p>
 <img src="{image_src(GRAYSCALE_TEST_PNG)}" alt="Grayscale test"/>
 """), single_image_asset(GRAYSCALE_TEST_PNG, images)),
             ("3. Gradient", make_chapter("Gradient Test", f"""
-<p>Verify gradient quantizes to 4 bands.</p>
+<p>Set <strong>Images</strong> to <strong>Display</strong>.</p>
+<p>Check for four solid levels and mixtures of adjacent shades in the gradients.</p>
 <img src="{image_src(GRADIENT_TEST_PNG)}" alt="Gradient test"/>
 """), single_image_asset(GRADIENT_TEST_PNG, images)),
             ("4. Centering", make_chapter("Centering Test", f"""
@@ -735,7 +734,7 @@ def main():
 <img src="{image_src(GRAYSCALE_TEST_JPG)}" alt="JPEG grayscale"/>
 <p>PNG image:</p>
 <img src="{image_src(GRAYSCALE_TEST_PNG)}" alt="PNG grayscale"/>
-<p>Both should render with proper grayscale.</p>
+<p>With <strong>Images</strong> set to <strong>Display</strong>, both should show four solid shades.</p>
 """), [(GRAYSCALE_TEST_JPG, images[GRAYSCALE_TEST_JPG]),
     (GRAYSCALE_TEST_PNG, images[GRAYSCALE_TEST_PNG])]),
         ]

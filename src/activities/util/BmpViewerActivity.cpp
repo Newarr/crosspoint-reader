@@ -2,6 +2,7 @@
 
 #include <Bitmap.h>
 #include <Epub/converters/JpegToFramebufferConverter.h>
+#include <Epub/converters/PixelCacheFormat.h>
 #include <Epub/converters/PngToFramebufferConverter.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -332,22 +333,24 @@ bool BmpViewerActivity::saveJpegSleepCover() {
   config.cachePath = JPEG_SLEEP_TMP_PXC;
   renderer.clearScreen();
   bool cacheWritten;
-  if (!decoder.decodeToFramebuffer(filePath, renderer, config, cacheWritten) || !cacheWritten) {
+  if (!decoder.decodeWithCacheResult(filePath, renderer, config, cacheWritten) || !cacheWritten) {
     LOG_ERR("BMP", "Failed to decode sleep image pixels");
     return false;
   }
 
   HalFile input, output;
   if (!Storage.openFileForRead("BMP", JPEG_SLEEP_TMP_PXC, input)) return false;
-  uint16_t width, height;
-  if (input.read(&width, sizeof(width)) != sizeof(width) || input.read(&height, sizeof(height)) != sizeof(height) ||
-      width != config.maxWidth || height != config.maxHeight) {
+  PixelCacheHeader cacheHeader;
+  if (input.read(&cacheHeader, sizeof(cacheHeader)) != sizeof(cacheHeader) || !cacheHeader.isValid() ||
+      cacheHeader.width != config.maxWidth || cacheHeader.height != config.maxHeight) {
     LOG_ERR("BMP", "Invalid sleep image pixels");
     return false;
   }
+  const auto width = cacheHeader.width;
+  const auto height = cacheHeader.height;
   const size_t pixelRowBytes = (width + 3) / 4;
   const size_t bmpRowBytes = (width + 15) / 16 * 4;
-  if (input.size() != 4 + pixelRowBytes * height) {
+  if (input.size() != sizeof(cacheHeader) + pixelRowBytes * height) {
     LOG_ERR("BMP", "Incomplete sleep image pixels");
     return false;
   }

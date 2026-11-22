@@ -69,7 +69,14 @@ class ContentOpfParser final : public Print {
   std::unique_ptr<ItemIndexEntry[]> itemIndex;
   size_t itemIndexSize = 0;
   bool useItemIndex = false;
-  bool findItemHrefSequential(const std::string& idref, std::string& href);
+  enum class ItemLookup { Found, Missing, IoError };
+  size_t itemStoreSize = 0;
+  size_t maxItemIdLength = 0;
+  size_t maxItemHrefLength = 0;
+  ItemLookup findItemHref(const std::string& idref, std::string& href);
+  ItemLookup findItemHrefSequential(const std::string& idref, std::string& href);
+  void failItemStore();
+  bool readItemRecord(std::string& id, std::string& href);
 
   // FNV-1a hash function
   static uint32_t fnvHash(const std::string& s) {

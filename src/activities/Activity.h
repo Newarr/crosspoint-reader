@@ -32,6 +32,8 @@ class Activity {
   virtual void onExit();
   // Last chance to queue activity-owned state before sleep events are drained.
   virtual void prepareForSleep() {}
+  virtual bool supportsStandbyResume() const { return false; }
+  virtual void onStandbyResume(bool fastWake = false) { (void)fastWake; }
   virtual void loop() {}
 
   virtual void render(RenderLock&&) {}
@@ -57,7 +59,7 @@ class Activity {
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
   // Caller holds RenderLock. Re-renders the visible screen into the framebuffer
   // if speculative background work left it stale (e.g. next-page staging).
-  virtual void ensureFreshFrameBuffer() {}
+  virtual bool ensureFreshFrameBuffer() { return true; }
 
   // Start a new activity without destroying the current one
   // Note: requestUpdate() will be invoked automatically once resultHandler finishes

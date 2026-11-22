@@ -2,6 +2,7 @@
 
 #include <ContentProtection.h>
 #include <Print.h>
+#include <ZipFile.h>
 
 #include <memory>
 #include <optional>
@@ -11,8 +12,6 @@
 
 #include "Epub/BookMetadataCache.h"
 #include "Epub/css/CssParser.h"
-
-class ZipFile;
 
 class Epub {
  public:
@@ -57,10 +56,13 @@ class Epub {
   CssParser::ParseResult parseCssFiles(CssParser::CacheStatus existingCacheStatus) const;
 
  public:
+  using ReadStreamResult = ZipFile::StreamResult;
+
   explicit Epub(std::string filepath, const std::string& cacheDir);
   ~Epub() = default;
   std::string& getBasePath() { return contentBasePath; }
   bool load(bool buildIfMissing = true, bool skipLoadingCss = false);
+  bool repairCssCache();
   bool loadMetadata(std::string& title, std::string& author);
   bool loadSyncMetadata(SyncMetadata& metadata);
   bool clearCache() const;
@@ -83,6 +85,8 @@ class Epub {
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize,
                                 bool allowEarlyStop = false) const;
+  ReadStreamResult streamItemContents(const std::string& itemHref, Print& out, size_t chunkSize,
+                                      bool allowEarlyStop = false) const;
   // Extract an item to a file on SD. On failure the partial file is removed.
   bool extractItemToFile(const std::string& itemHref, const std::string& destPath) const;
   bool getItemSize(const std::string& itemHref, size_t* size) const;

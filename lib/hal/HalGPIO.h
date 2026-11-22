@@ -57,7 +57,6 @@ class HalGPIO {
 
  private:
   DeviceType _deviceType = DeviceType::X4;
-  bool sampleUsbConnected() const;
 
  public:
   HalGPIO() = default;
@@ -78,6 +77,12 @@ class HalGPIO {
   bool beginAsync(uint32_t pollIntervalMs = 5);
   void prepareForDeepSleep();
 
+  using ButtonTransition = InputManager::ButtonTransition;
+
+  uint8_t frameTransitionCount() const;
+  ButtonTransition frameTransition(uint8_t index) const;
+  bool frameTransitionsOverflowed() const;
+
   // Button input methods
   void update();
   bool isPressed(uint8_t buttonIndex) const;
@@ -97,10 +102,7 @@ class HalGPIO {
   bool wasAnyReleased() const;
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
-  // True when any button contact is closed right now, read straight from the
-  // hardware (ADC ladder off its idle rail, the power GPIO asserted, or the T5S3
-  // expander key, one I2C read), without going through the debounced state.
-  // Cheap enough to call every few ms.
+  // True if raw input is active. Async mode returns the last sample.
   bool rawInputActive();
   bool hasTouch() const;
   // Capacitive Home key reported by the touch controller (X4 Pro). The tap
@@ -144,6 +146,7 @@ class HalGPIO {
 
   // Check if USB is connected
   bool isUsbConnected() const;
+  bool sampleUsbConnected() const;
   bool isUsbSerialActive() const;
 
   // Whether a cold boot with no USB detected can be trusted to mean a held

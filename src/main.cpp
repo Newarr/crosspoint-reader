@@ -10,12 +10,14 @@
 #include <HalFrontlight.h>
 #include <HalGPIO.h>
 #include <HalMemory.h>
+#include <HalOtaSlot.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <HalSystem.h>
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <MinizConfig.h>
 #include <SPI.h>
 #include <SdCardFont.h>
 #include <TrustedTime.h>
@@ -25,7 +27,6 @@
 #include <builtinFonts/all.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h>
-#include <nvs.h>
 #include <time.h>
 
 #include <algorithm>
@@ -56,7 +57,6 @@
 #include "util/ButtonNavigator.h"
 #include "util/PluginEvents.h"
 #include "util/ScreenshotUtil.h"
-#include "util/SleepFrameHash.h"
 #include "util/SlideSwitch.h"
 #include "util/Timezones.h"
 
@@ -77,6 +77,8 @@ FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts(), renderer.getTtfFonts());
 static unsigned long allowSleepAt = 0;
+static bool g_otaConfirmationPending = false;
+static uint32_t g_otaArmDisplayCount = 0;
 
 // Fonts
 EpdFont notosans14RegularFont(&notosans_14_regular);
@@ -342,42 +344,7 @@ const bleturner::Host host{heap,          releaseCaches, deliver, yieldForRadio,
 
 constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
 constexpr char SLEEP_FRAME_TEMP[] = "/.crosspoint/sleep_frame.bin.tmp";
-constexpr char WAKE_NVS_NAMESPACE[] = "crosspoint";
-constexpr char WAKE_SHORT_PRESS_KEY[] = "wakeShortPr";
-
 static bool shortPowerPressWakes() { return SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP; }
-
-static bool readShortPowerWakePreference() {
-  nvs_handle_t handle;
-  if (nvs_open(WAKE_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
-  uint8_t enabled = 0;
-  const bool valid = nvs_get_u8(handle, WAKE_SHORT_PRESS_KEY, &enabled) == ESP_OK;
-  nvs_close(handle);
-  return valid && enabled == 1;
-}
-
-static void mirrorShortPowerWakePreference() {
-  if (!gpio.deviceIsX3() || BootRecovery::shouldSkip(BootRecovery::Stage::Settings)) return;
-  static uint8_t mirrored = UINT8_MAX;
-  static uint8_t attempted = UINT8_MAX;
-  static unsigned long lastAttemptMs = 0;
-  const uint8_t enabled = shortPowerPressWakes();
-  const unsigned long now = millis();
-  if (enabled == mirrored || (enabled == attempted && now - lastAttemptMs < 1000)) return;
-  attempted = enabled;
-  lastAttemptMs = now;
-  nvs_handle_t handle;
-  if (nvs_open(WAKE_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return;
-  uint8_t stored = 0;
-  const bool alreadyStored = nvs_get_u8(handle, WAKE_SHORT_PRESS_KEY, &stored) == ESP_OK && stored == enabled;
-  if (alreadyStored || (nvs_set_u8(handle, WAKE_SHORT_PRESS_KEY, enabled) == ESP_OK && nvs_commit(handle) == ESP_OK)) {
-    mirrored = enabled;
-  } else {
-    mirrored = UINT8_MAX;
-    LOG_ERR("MAIN", "Could not save power wake preference");
-  }
-  nvs_close(handle);
-}
 
 static bool sleepFrameSizeValid(size_t fileSize, size_t frameSize) {
   return fileSize == frameSize || fileSize == frameSize + sizeof(uint32_t);
@@ -408,7 +375,7 @@ static bool matchesSleepFrame(const char* path, const uint8_t* frame, size_t fra
 }
 
 static bool storeSleepFrame(const uint8_t* framebuffer, size_t frameSize) {
-  const uint32_t hash = sleepFrameAdler32(framebuffer, frameSize);
+  const uint32_t hash = mz_adler32(MZ_ADLER32_INIT, framebuffer, frameSize);
   if (matchesSleepFrame(SLEEP_FRAME_FILE, framebuffer, frameSize, hash)) return true;
 
   HalFile file;
@@ -447,7 +414,7 @@ static bool loadSleepFrameBuffer() {
       framebuffer && sleepFrameSizeValid(file.size(), frameSize) &&
       file.read(framebuffer, frameSize) == static_cast<int>(frameSize) &&
       (!hasChecksum || (file.read(&storedHash, sizeof(storedHash)) == static_cast<int>(sizeof(storedHash)) &&
-                        storedHash == sleepFrameAdler32(framebuffer, frameSize)));
+                        storedHash == mz_adler32(MZ_ADLER32_INIT, framebuffer, frameSize)));
   file.close();
   if (!valid || !hasChecksum) Storage.remove(SLEEP_FRAME_FILE);
   return valid;
@@ -570,10 +537,10 @@ static bool joinWifiForSleep(const bool showPopup) {
 // drain (at-least-once). The caller's WiFi shutdown tears the radio down
 // either way. Deferrable events already queued (reader.exit) ride along in
 // the same drain.
-static void deliverSleepPluginEvents(const bool allowNetwork) {
+static bool deliverSleepPluginEvents(const bool allowNetwork) {
   // Activity-owned state must be queued before sleep.enter and before this
   // same-sleep drain. The hook is idempotent with ordinary activity teardown.
-  activityManager.prepareForSleep();
+  const bool sleepFrameFresh = activityManager.prepareForSleep();
 
   // Sleeping straight out of a book is the common flow, but the reader's own
   // reader.exit only fires later, inside goToSleep() — after this drain. Carry
@@ -594,20 +561,21 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
   pluginevents::emit(pluginevents::Event::SleepEnter, vars, varCount);
   if (!allowNetwork) {
     LOG_INF("SLP", "Sleep events not delivered: network not allowed");
-    return;
+    return sleepFrameFresh;
   }
   if (WiFi.status() == WL_CONNECTED) {
     pluginevents::drain(&renderer);
-    return;
+    return sleepFrameFresh;
   }
   // Any connect-flagged queued event justifies the join, not only
   // sleep.enter: reader.session is queued while reading and delivered on this
   // same sleep, and a progress-sync plugin usually subscribes to it alone.
   if (!pluginevents::wantsConnectAny()) {
     LOG_INF("SLP", "Sleep events not delivered: no queued event asks for a connection");
-    return;
+    return sleepFrameFresh;
   }
   if (joinWifiForSleep(true)) pluginevents::drain(&renderer);
+  return sleepFrameFresh;
 }
 
 // Sync On Sleep: syncs the book the reader was showing. Runs after the sleep
@@ -694,7 +662,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   const bool bluetoothStopped = bleturner::beforeSleep(2000);
   if (!bluetoothStopped) LOG_ERR("SLP", "Bluetooth did not stop; deferring sleep-event delivery");
   sleepJoinFailed = false;
-  deliverSleepPluginEvents(bluetoothStopped);
+  const bool sleepFrameFresh = deliverSleepPluginEvents(bluetoothStopped);
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -710,11 +678,11 @@ void enterDeepSleep(bool fromTimeout = false) {
 #endif
   if (!standby) activityManager.goToSleep(fromTimeout);
 
-  const bool retained = isQuickResumeSleep ? saveSleepFrameBuffer()
-                                           : (!Storage.exists(SLEEP_FRAME_FILE) || Storage.remove(SLEEP_FRAME_FILE));
+  const bool retained = (isQuickResumeSleep && sleepFrameFresh)
+                            ? saveSleepFrameBuffer()
+                            : (!Storage.exists(SLEEP_FRAME_FILE) || Storage.remove(SLEEP_FRAME_FILE));
   APP_STATE.showBootScreen = !retained;
   APP_STATE.saveToFile();
-  mirrorShortPowerWakePreference();
 
   syncBookOnSleep(bluetoothStopped);
 
@@ -747,17 +715,57 @@ void enterDeepSleep(bool fromTimeout = false) {
       gpio.update();
       mappedInputManager.beginPowerInput(true,
                                          mappedInputManager.isPowerHeld() || gpio.wasReleased(HalGPIO::BTN_POWER));
-      display.begin();
+      display.begin(true);
       renderer.setOrientation(orientationBeforeStandby);
-      APP_STATE.showBootScreen = true;
-      APP_STATE.saveToFile();
       deepSleepInProgress = false;
       lastInputTime = millis();
       lastActivityTime = lastInputTime;
       allowSleepAt = lastInputTime + 2000;
+
+      if (!Storage.isCardResponsive() || !Storage.exists("/.crosspoint")) {
+        const std::string resumeBook = APP_STATE.openEpubPath;
+        const bool wasReader = APP_STATE.lastSleepFromReader;
+        activityManager.finishStandby(false);
+        for (const auto& entry : renderer.getSdCardFonts()) {
+          if (entry.second) entry.second->closeFileHandle();
+        }
+        const bool remounted = Storage.reinit();
+        display.requestResync();
+        if (remounted && !APP_STATE.showBootScreen) {
+          APP_STATE.showBootScreen = true;
+          APP_STATE.saveToFile();
+        }
+        if (remounted && wasReader && !resumeBook.empty() && Storage.exists(resumeBook.c_str())) {
+          activityManager.goToReader(resumeBook);
+        } else {
+          activityManager.goHome(HomeMenuItem::NONE, true);
+        }
+        return;
+      }
+
+      if (!APP_STATE.showBootScreen) {
+        APP_STATE.showBootScreen = true;
+        APP_STATE.saveToFile();
+      }
+      const bool sleepScreenPureBw =
+          isQuickResumeSleep || SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::DARK ||
+          SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT ||
+          SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::BLANK;
+      const bool hasBwBaseline =
+          sleepScreenPureBw && renderer.hasFrameBuffer() && (isQuickResumeSleep || SETTINGS.screenInverted == 0);
+      const bool fastStandbyWake =
+          hasBwBaseline &&
+          (isQuickResumeSleep || SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::BLANK);
+      if (hasBwBaseline) {
+        renderer.cleanupGrayscaleWithFrameBuffer();
+      }
+      if (!fastStandbyWake) {
+        display.requestResync();
+      }
+      activityManager.finishStandby(true, fastStandbyWake);
+      return;
     }
-    activityManager.finishStandby(woke);
-    if (woke) return;
+    activityManager.finishStandby(false);
   }
 #endif
   for (const auto& entry : renderer.getSdCardFonts()) {
@@ -859,14 +867,8 @@ void setup() {
   }
 
   const auto wakeupReason = gpio.getWakeupReason();
-  const bool x3EarlyWakeCheck = gpio.deviceIsX3() && wakeupReason == HalGPIO::WakeupReason::PowerButton;
-  const bool earlyShortPressWake = x3EarlyWakeCheck && readShortPowerWakePreference();
   const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || BoardConfig::isMetalioEInk4() ||
-                                earlyShortPressWake || gpio.verifyPowerButtonWakeup();
-  if (x3EarlyWakeCheck && !wakeHoldVerified) {
-    LOG_DBG("MAIN", "Power-button wake released before SD init");
-    powerManager.startDeepSleep(gpio);
-  }
+                                gpio.verifyPowerButtonWakeup();
 
   using BootStage = BootRecovery::Stage;
   gpio.update();
@@ -885,8 +887,13 @@ void setup() {
   const auto recoveryButton = (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? MappedInputManager::Button::Down
                                                                                      : MappedInputManager::Button::Up;
   // The Picco has no second app slot to flash into (partitions_picco.csv).
-  const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
-                                    !BoardConfig::isPicco() && mappedInputManager.isPressed(recoveryButton);
+  const bool checkRecoveryButton =
+      wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() && !BoardConfig::isPicco();
+  if (checkRecoveryButton && gpio.deviceIsX3() && !mappedInputManager.isPressed(recoveryButton)) {
+    delay(6);
+    gpio.update();
+  }
+  const bool recoveryFirmwareMode = checkRecoveryButton && mappedInputManager.isPressed(recoveryButton);
 
   halTiltSensor.begin();
   halClock.begin();
@@ -919,10 +926,11 @@ void setup() {
   const auto loadStore = [](BootStage stage, auto& store) {
     if (!BootRecovery::enterStore(stage)) {
       store.suspendPersistence();
-      return;
+      return false;
     }
-    store.loadFromFile();
+    const bool loaded = store.loadFromFile();
     BootRecovery::leaveStore();
+    return loaded;
   };
 
   loadStore(BootStage::State, APP_STATE);
@@ -941,8 +949,7 @@ void setup() {
   if (gpio.hasTouch()) {
     SETTINGS.readerMenuStyle = CrossPointSettings::READER_MENU_TOOLBAR;
   }
-  loadStore(BootStage::Settings, SETTINGS);
-  mirrorShortPowerWakePreference();
+  const bool settingsLoaded = loadStore(BootStage::Settings, SETTINGS);
   // Push the saved timezone's POSIX rule into the clock (migrating the legacy
   // UTC-offset setting on first boot after the update).
   timezones::applyToClock();
@@ -977,8 +984,7 @@ void setup() {
       // With Short Power Button Press = Sleep, a single click wakes on any
       // device; otherwise the button must still be held (ghost-wake debounce).
       // Picco: plugging in USB pulses the wake line; power on, as stock does.
-      if (!x3EarlyWakeCheck && !wakeHoldVerified && !shortPowerPressWakes() &&
-          !(FREEINK_DEVICE_PICCO && gpio.isUsbConnected())) {
+      if (!wakeHoldVerified && !shortPowerPressWakes() && !(FREEINK_DEVICE_PICCO && gpio.isUsbConnected())) {
         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
         Storage.prepareForDeepSleep();
         powerManager.startDeepSleep(gpio);
@@ -1054,6 +1060,18 @@ void setup() {
   const bool frameReady = !uc8279Wake || preflightSleepFrameBuffer();
   powerManager.beginBatteryCache();
   setupDisplayAndFonts(resume != BootResume::Splash && frameReady);
+
+  BootRecovery::complete();
+  if (!BootRecovery::active() && HalOtaSlot::runningImageState() == HalOtaSlot::RunningImageState::PendingVerify) {
+    const char* settingsPath = SETTINGS.getFilePath();
+    const bool firstBoot =
+        !Storage.exists(settingsPath) && !Storage.exists((std::string(settingsPath) + ".tmp").c_str());
+    if (settingsLoaded || firstBoot) {
+      g_otaConfirmationPending = true;
+      renderer.setDeferAsyncDisplay(true);
+      g_otaArmDisplayCount = renderer.blockingDisplayCount();
+    }
+  }
 
   switch (resume) {
     case BootResume::Silent:
@@ -1142,12 +1160,31 @@ void setup() {
 
   mappedInputManager.beginPowerInput(!isSilentReboot || suppressRestartPower, mappedInputManager.isPowerHeld());
   if (gpio.deviceIsX3() && !gpio.beginAsync(5)) LOG_ERR("GPIO", "Could not start asynchronous input");
-  BootRecovery::complete();
   lastActivityTime = millis();
   allowSleepAt = millis() + (isSilentReboot ? 0 : 2000);
 }
 
+static void confirmOtaAfterDisplay() {
+  if (!g_otaConfirmationPending) return;
+  constexpr uint32_t RETRY_INTERVAL_MS = 500;
+  const uint32_t now = millis();
+  static uint32_t lastAttemptMs = now - RETRY_INTERVAL_MS;
+  if (now - lastAttemptMs < RETRY_INTERVAL_MS) return;
+
+  RenderLock lock(RenderLock::Mode::Try);
+  if (!lock.ownsLock() || renderer.blockingDisplayCount() <= g_otaArmDisplayCount) return;
+  lastAttemptMs = now;
+  if (!HalOtaSlot::confirmRunningImage()) {
+    LOG_ERR("OTA", "Failed to confirm running firmware");
+    return;
+  }
+  g_otaConfirmationPending = false;
+  renderer.setDeferAsyncDisplay(false);
+  renderer.preloadFlashFonts();
+}
+
 void loop() {
+  confirmOtaAfterDisplay();
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
@@ -1192,7 +1229,6 @@ void loop() {
 
   // After the exclusive-storage return: it saves settings to the SD card.
   handleSlideSwitch();
-  mirrorShortPowerWakePreference();
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 
   // Under the render lock, so a step never overlaps the themes' gauge reads.
@@ -1227,12 +1263,15 @@ void loop() {
       cmd.trim();
       if (cmd == "SCREENSHOT") {
         RenderLock lock;
-        activityManager.ensureFreshFrameBuffer();
-        const uint32_t bufferSize = display.getBufferSize();
-        logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
-        uint8_t* buf = display.getFrameBuffer();
-        logSerial.write(buf, bufferSize);
-        logSerial.printf("SCREENSHOT_END\n");
+        if (!activityManager.ensureFreshFrameBuffer()) {
+          LOG_ERR("MAIN", "Could not restore screen for screenshot");
+        } else {
+          const uint32_t bufferSize = display.getBufferSize();
+          logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
+          uint8_t* buf = display.getFrameBuffer();
+          logSerial.write(buf, bufferSize);
+          logSerial.printf("SCREENSHOT_END\n");
+        }
       }
     }
   }
@@ -1242,7 +1281,7 @@ void loop() {
                          halTiltSensor.hadActivity() || remoteActed;
   if (userInput) {
     lastInputTime = millis();
-    powerManager.pokeNormalSpeed();
+    powerManager.setPowerSaving(false);
   }
   idleDisplayWhileAwake();
   if (userInput || activityManager.preventAutoSleep()) {
@@ -1260,7 +1299,10 @@ void loop() {
       mappedInputManager.consumePowerGesture();
       {
         RenderLock lock;
-        activityManager.ensureFreshFrameBuffer();
+        if (!activityManager.ensureFreshFrameBuffer()) {
+          LOG_ERR("MAIN", "Could not restore screen for screenshot");
+          return;
+        }
         ScreenshotUtil::takeScreenshot(renderer);
       }
     }
@@ -1278,18 +1320,10 @@ void loop() {
     screenshotComboActive = false;
   }
 
-  if (mappedInputManager.wasPowerReleaseConsumed()) {
-    mappedInputManager.resetPowerButtonInput();
-    if (!mappedInputManager.powerSleepRequested()) return;
-  }
-
   if (mappedInputManager.powerSleepClick()) {
     enterDeepSleep();
     return;
   }
-  const bool powerDoubleClickEnabled =
-      CrossPointSettings::hasPowerDoubleClick() && SETTINGS.doublePwrBtn != CrossPointSettings::IGNORE;
-
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
   if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
@@ -1297,14 +1331,7 @@ void loop() {
     return;
   }
 
-  // With a double-click action and SLEEP, a press still within the click window is a
-  // double-click candidate — let it be released and evaluated above instead
-  // of sleeping on button-down.
-  const bool awaitingClickWindow = powerDoubleClickEnabled &&
-                                   SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP &&
-                                   gpio.getPowerButtonHeldTime() <= PowerButtonClickInput::MAX_CLICK_HOLD_MS;
-
-  if (!awaitingClickWindow && millis() >= allowSleepAt && mappedInputManager.powerSleepRequested()) {
+  if (millis() >= allowSleepAt && mappedInputManager.powerSleepRequested()) {
     // If the screenshot combination is potentially being pressed, don't sleep
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
@@ -1313,9 +1340,6 @@ void loop() {
     enterDeepSleep();
     return;
   }
-
-  // A completed long hold stays consumed even when sleep is temporarily blocked.
-  if (mappedInputManager.wasPowerReleaseConsumed()) return;
 
 #if FREEINK_DEVICE_PAPERMONO
   // Paper Mono reports the PMIC power button as a one-tick click, so the held
@@ -1408,7 +1432,7 @@ void loop() {
         }
       }
       if (wokeOnInput) {
-        powerManager.pokeNormalSpeed();
+        powerManager.setPowerSaving(false);
         lastActivityTime = millis();
       }
     } else {

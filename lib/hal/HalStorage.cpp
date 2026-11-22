@@ -47,6 +47,16 @@ void HalStorage::prepareForDeepSleep() {
   SDCard.shutdown();
 }
 
+bool HalStorage::reinit() {
+  StorageLock lock;
+  return SDCard.reinit();
+}
+
+bool HalStorage::isCardResponsive() {
+  StorageLock lock;
+  return SDCard.isCardResponsive();
+}
+
 bool HalStorage::beginUsbDrive() {
 #if FREEINK_CAP_USB_MSC
   StorageLock lock;

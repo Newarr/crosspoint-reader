@@ -222,16 +222,19 @@ TEST_F(FlashBlobCacheTest, DeclinesWhatItCannotHold) {
   EXPECT_EQ(acquire(tooLarge), nullptr);  // larger than a slot
 
   const auto blob = makeBlob(2000, 5);
+  const int erasesBeforeFail = fake::erases;
   gFailReads = true;
-  EXPECT_EQ(acquire(blob), nullptr);  // SD read failed mid-copy
+  EXPECT_EQ(acquire(blob), nullptr);  // SD read failed on first chunk before erasing a slot
+  EXPECT_EQ(fake::erases, erasesBeforeFail);
   gFailReads = false;
-  // Each copy erases a slot first, so a failed one is not retried.
-  EXPECT_FALSE(FlashBlobCache::canHold(keyOf(blob), static_cast<uint32_t>(blob.size())));
-  const int erases = fake::erases;
+  // Transient source I/O errors remain retryable once storage recovers.
+  EXPECT_TRUE(FlashBlobCache::canHold(keyOf(blob), static_cast<uint32_t>(blob.size())));
   gReads = 0;
-  EXPECT_EQ(acquire(blob), nullptr);
-  EXPECT_EQ(gReads, 0);
-  EXPECT_EQ(fake::erases, erases);
+  const uint8_t* recovered = acquire(blob);
+  ASSERT_NE(recovered, nullptr);
+  EXPECT_GT(gReads, 0);
+  EXPECT_EQ(std::memcmp(recovered, blob.data(), blob.size()), 0);
+  release(recovered);
   // Other blobs still copy.
   EXPECT_NE(acquire(makeBlob(2000, 7)), nullptr);
 }

@@ -55,7 +55,8 @@ class GfxRenderer {
   bool ditherImagesInBw = false;
   Orientation orientation;
   bool fadingFix;
-  mutable bool otaConfirmationPending_ = false;
+  bool deferAsyncDisplay_ = false;
+  mutable uint32_t blockingDisplayCount_ = 0;
   uint8_t* frameBuffer = nullptr;
   uint32_t frameBufferLoans = 0;
   uint16_t panelWidth = HalDisplay::DISPLAY_WIDTH;
@@ -68,7 +69,6 @@ class GfxRenderer {
   struct WidthCache {
     uint64_t keys[WIDTH_CACHE_SLOTS] = {};
     int widths[WIDTH_CACHE_SLOTS];
-    size_t count = 0;
   };
   mutable std::unique_ptr<WidthCache> widthCache_;
   // Mutable because ensureSdCardFontReady() is const (called from layout code
@@ -233,6 +233,9 @@ class GfxRenderer {
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  void setDeferAsyncDisplay(bool defer) { deferAsyncDisplay_ = defer; }
+  uint32_t blockingDisplayCount() const { return blockingDisplayCount_; }
+  void preloadFlashFonts() const;
   bool canStageNextFrame() const;
   bool stageNextFrame(bool (*shouldAbort)(void*) = nullptr, void* abortCtx = nullptr) const;
   bool triggerStagedFastRefresh() const;
@@ -249,12 +252,12 @@ class GfxRenderer {
   // Non-blocking refresh: starts the waveform and returns so CPU work (e.g.
   // grayscale strip rendering) can overlap the panel's refresh time. The
   // framebuffer must stay untouched until waitRefreshComplete(). Falls back to
-  // a blocking refresh when fadingFix is enabled or the panel lacks deferral
-  // support. See HalDisplay::displayBufferAsync for the baseline contract.
+  // a blocking refresh when fadingFix or deferAsyncDisplay_ is set, or the
+  // panel lacks deferral support.
   void displayBufferAsync(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   void waitRefreshComplete() const;
   // True when displayBufferAsync() genuinely overlaps: panel defers and
-  // fadingFix isn't forcing the blocking path. Callers can skip overlap
+  // the renderer allows async display. Callers can skip overlap
   // scaffolding (e.g. whole-plane grayscale buffers) when false.
   bool supportsAsyncRefresh() const;
   // When checking stripUploads, pass the grayscale mode used for the planes.
@@ -347,6 +350,7 @@ class GfxRenderer {
   enum class TextMeasureMode { Layout, Rendered };
   void setWidthCacheEnabled(bool enabled) const;
   void clearWidthCache() const;
+  void releaseWordWidthCache() const;
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR,
                    BidiUtils::BidiBaseDir baseDir = BidiUtils::BidiBaseDir::AUTO) const;
   void drawCenteredText(int fontId, int y, const char* text, bool black = true,

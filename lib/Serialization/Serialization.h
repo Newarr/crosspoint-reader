@@ -27,7 +27,9 @@ void readPod(std::istream& is, T& value) {
 
 template <typename T>
 void readPod(HalFile& file, T& value) {
-  file.read(reinterpret_cast<uint8_t*>(&value), sizeof(T));
+  if (file.read(reinterpret_cast<uint8_t*>(&value), sizeof(T)) != static_cast<int>(sizeof(T))) {
+    value = T{};
+  }
 }
 
 template <typename T>
@@ -52,18 +54,19 @@ inline bool tryWriteString(HalFile& file, const std::string& s) {
   return tryWritePod(file, len) && (len == 0 || file.write(reinterpret_cast<const uint8_t*>(s.data()), len) == len);
 }
 
-inline void readString(std::istream& is, std::string& s) {
-  uint32_t len;
-  readPod(is, len);
-  s.resize(len);
-  is.read(&s[0], len);
-}
+inline constexpr size_t MAX_READ_STRING_BYTES = 65536;
 
-inline void readString(HalFile& file, std::string& s) {
-  uint32_t len;
-  readPod(file, len);
+inline void readString(std::istream& is, std::string& s) {
+  uint32_t len = 0;
+  readPod(is, len);
+  if (!is || len > MAX_READ_STRING_BYTES) {
+    s.clear();
+    return;
+  }
   s.resize(len);
-  file.read(&s[0], len);
+  if (len > 0 && !is.read(&s[0], len)) {
+    s.clear();
+  }
 }
 
 inline bool tryReadString(HalFile& file, std::string& s, const size_t maxLength) {
@@ -77,5 +80,11 @@ inline bool tryReadString(HalFile& file, std::string& s, const size_t maxLength)
   }
   s.resize(len);
   return len == 0 || file.read(&s[0], len) == static_cast<int>(len);
+}
+
+inline void readString(HalFile& file, std::string& s) {
+  if (!tryReadString(file, s, MAX_READ_STRING_BYTES)) {
+    s.clear();
+  }
 }
 }  // namespace serialization

@@ -382,16 +382,14 @@ CssParser::ParseResult Epub::parseCssFiles(const CssParser::CacheStatus existing
       parseResult = CssParser::ParseResult::Error;
       continue;
     }
-    if (!readItemContentsToStream(cssPath, tempCssFile, 1024)) {
-      LOG_ERR("EBP", "Could not read CSS file: %s", cssPath.c_str());
-      // Explicitly close() file before calling Storage.remove()
-      tempCssFile.close();
+    const bool streamed = readItemContentsToStream(cssPath, tempCssFile, 1024);
+    const bool closed = tempCssFile.close();
+    if (!streamed || !closed) {
+      LOG_ERR("EBP", "Could not stage CSS file: %s", cssPath.c_str());
       Storage.remove(tmpCssPath.c_str());
       parseResult = CssParser::ParseResult::Error;
       continue;
     }
-    // Explicitly close() file before reopening for reading
-    tempCssFile.close();
 
     // Parse the CSS file
     if (!Storage.openFileForRead("EBP", tmpCssPath, tempCssFile)) {
@@ -429,6 +427,13 @@ CssParser::ParseResult Epub::parseCssFiles(const CssParser::CacheStatus existing
     return parseResult;
   }
 
+  const auto sectionsPath = cachePath + "/sections";
+  if (Storage.exists(sectionsPath.c_str()) && !Storage.removeDir(sectionsPath.c_str())) {
+    LOG_ERR("EBP", "Failed to invalidate section layouts for new CSS");
+    cssParser->clear();
+    return CssParser::ParseResult::Error;
+  }
+
   // A partial cache remains useful for this session, but its header ensures a
   // later EPUB load retries the source stylesheets when more heap is available.
   if (!cssParser->saveToCache(parseResult == CssParser::ParseResult::Complete)) {
@@ -462,21 +467,15 @@ bool Epub::openProtection() {
   return true;
 }
 
+bool Epub::repairCssCache() {
+  BookMetadataCache::BookMetadata sourceMetadata;
+  if (!parseContentOpf(sourceMetadata, /*writeSpineEntries=*/false)) return false;
+  discoverCssFilesFromZip();
+  return parseCssFiles(CssParser::CacheStatus::Invalid) != CssParser::ParseResult::Error;
+}
+
 bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   LOG_DBG("EBP", "Loading ePub: %s", filepath.c_str());
-
-  if (!buildIfMissing && !skipLoadingCss && bookMetadataCache && bookMetadataCache->isLoaded() && cssParser) {
-    BookMetadataCache::BookMetadata sourceMetadata;
-    if (!parseContentOpf(sourceMetadata, /*writeSpineEntries=*/false)) return false;
-    discoverCssFilesFromZip();
-    const auto status = cssParser->inspectCache();
-    const auto result = parseCssFiles(status);
-    if (result == CssParser::ParseResult::Error) return false;
-    if (result == CssParser::ParseResult::Complete || status != CssParser::CacheStatus::Partial) {
-      Storage.removeDir((cachePath + "/sections").c_str());
-    }
-    return true;
-  }
 
   if (!openProtection()) return false;
 
@@ -511,29 +510,20 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
       const CssParser::CacheStatus cacheStatus = cssParser->inspectCache();
       if (cacheStatus != CssParser::CacheStatus::Complete) {
         LOG_DBG("EBP", "CSS cache missing, partial, or invalid; attempting to parse source stylesheets");
-        if (cacheStatus == CssParser::CacheStatus::Invalid) cssParser->deleteCache();
 
         BookMetadataCache::BookMetadata cachedMetadata = bookMetadataCache->coreMetadata;
-        CssParser::ParseResult cssParseResult = CssParser::ParseResult::Error;
         if (!parseContentOpf(cachedMetadata, /*writeSpineEntries=*/false)) {
           LOG_ERR("EBP", "Could not parse content.opf from cached bookMetadata for CSS files");
         } else {
           discoverCssFilesFromZip();
           bookMetadataCache.reset();
-          cssParseResult = parseCssFiles(cacheStatus);
+          parseCssFiles(cacheStatus);
         }
         bookMetadataCache.reset();
         bookMetadataCache = makeUniqueNoThrow<BookMetadataCache>(cachePath);
         if (!bookMetadataCache || !bookMetadataCache->load()) {
           LOG_ERR("EBP", "Failed to reload cache after CSS rebuild");
           return false;
-        }
-        const bool cssCacheChanged =
-            cssParseResult == CssParser::ParseResult::Complete ||
-            (cssParseResult == CssParser::ParseResult::Partial && cacheStatus != CssParser::CacheStatus::Partial);
-        if (cssCacheChanged) {
-          // The CSS cache changed, so section caches must use the same rule set.
-          Storage.removeDir((cachePath + "/sections").c_str());
         }
       }
     }
@@ -582,23 +572,28 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
 
   [[maybe_unused]] const uint32_t tocStart = millis();
   if (!bookMetadataCache->beginTocPass()) return false;
-  const bool navValid = !tocNavItem.empty() && parseTocNavFile();
-  const int navCoverage = bookMetadataCache->getTocSpineCoverage();
-  const int navCount = navValid ? bookMetadataCache->getTocCount() : 0;
-  if (!bookMetadataCache->endTocPass()) return false;
+  const bool haveNav = !tocNavItem.empty();
+  const bool primaryParsed = haveNav ? parseTocNavFile() : !tocNcxItem.empty() && parseTocNcxFile();
+  const int primaryCount = primaryParsed ? bookMetadataCache->getTocCount() : 0;
+  const int primaryCoverage = bookMetadataCache->getTocSpineCoverage();
+  const bool primaryWritten = bookMetadataCache->endTocPass();
 
-  bool useNcx = false;
-  int ncxCount = 0;
-  if (!tocNcxItem.empty() && (navCount == 0 || navCoverage < bookMetadataCache->getSpineCount())) {
-    if (!bookMetadataCache->beginTocPass(true)) return false;
-    const bool ncxValid = parseTocNcxFile();
-    ncxCount = ncxValid ? bookMetadataCache->getTocCount() : 0;
+  bool useAlternate = false;
+  int alternateCount = 0;
+  const bool compareNcx = haveNav && !tocNcxItem.empty() &&
+                          (!primaryWritten || primaryCount == 0 ||
+                           (primaryCoverage >= 0 && primaryCoverage < bookMetadataCache->getSpineCount()));
+  if (compareNcx && bookMetadataCache->beginTocPass(true)) {
+    const bool ncxParsed = parseTocNcxFile();
+    alternateCount = bookMetadataCache->getTocCount();
     const int ncxCoverage = bookMetadataCache->getTocSpineCoverage();
-    useNcx = ncxCount > 0 && (navCount == 0 || (navCoverage >= 0 && ncxCoverage > navCoverage));
-    if (!bookMetadataCache->endTocPass()) return false;
+    const bool ncxWritten = bookMetadataCache->endTocPass();
+    useAlternate = ncxParsed && ncxWritten && alternateCount > 0 &&
+                   (!primaryWritten || primaryCount == 0 || ncxCoverage > primaryCoverage);
   }
 
-  bookMetadataCache->selectTocPass(useNcx, useNcx ? ncxCount : navCount);
+  if (!primaryWritten && !useAlternate) return false;
+  bookMetadataCache->selectTocPass(useAlternate, useAlternate ? alternateCount : primaryCount);
   LOG_DBG("EBP", "TOC pass completed in %lu ms", millis() - tocStart);
 
   // Close the cache files
@@ -623,9 +618,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   if (!skipLoadingCss) {
     // Parse CSS before reloading book.bin to leave more heap for CSS rule-table growth.
     bookMetadataCache.reset();
-    if (parseCssFiles(cssParser->inspectCache()) != CssParser::ParseResult::Error) {
-      Storage.removeDir((cachePath + "/sections").c_str());
-    }
+    parseCssFiles(cssParser->inspectCache());
   }
 
   // Reload the cache from disk so it's in the correct state
@@ -1107,29 +1100,40 @@ uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size
 
 bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, const size_t chunkSize,
                                     const bool allowEarlyStop) const {
+  return streamItemContents(itemHref, out, chunkSize, allowEarlyStop) == ReadStreamResult::Ok;
+}
+
+Epub::ReadStreamResult Epub::streamItemContents(const std::string& itemHref, Print& out, const size_t chunkSize,
+                                                const bool allowEarlyStop) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
-    return false;
+    return ReadStreamResult::NotFound;
   }
 
   if (Txt::isTxtOrMd(filepath)) {
-    return Txt::streamTxtToHtml(filepath, out);
+    return Txt::streamTxtToHtml(filepath, out) ? ReadStreamResult::Ok : ReadStreamResult::IoError;
   }
 
   const std::string path = FsHelpers::normalisePath(itemHref);
 
   if (decryptor && decryptor->isEncrypted(path)) {
-    auto append = [](void* context, const uint8_t* data, size_t size) {
-      return static_cast<Print*>(context)->write(data, size) == size;
+    struct Sink {
+      Print& out;
+      bool shortWrite = false;
+    } sink{out};
+    const auto append = [](void* context, const uint8_t* data, size_t size) {
+      auto& sink = *static_cast<Sink*>(context);
+      sink.shortWrite = sink.out.write(data, size) != size;
+      return !sink.shortWrite;
     };
-    if (!decryptor->decryptToSink(path, append, &out)) {
+    if (!decryptor->decryptToSink(path, append, &sink) && !(allowEarlyStop && sink.shortWrite)) {
       LOG_ERR("EBP", "content read failed for %s", path.c_str());
-      return false;
+      return ReadStreamResult::IoError;
     }
-    return true;
+    return ReadStreamResult::Ok;
   }
 
-  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop);
+  return ZipFile(filepath).streamFile(path.c_str(), out, chunkSize, allowEarlyStop);
 }
 
 bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath) const {
@@ -1144,38 +1148,28 @@ bool Epub::extractItemToFile(const std::string& itemHref, const std::string& des
   class AbortingFilePrint final : public Print {
     HalFile& file;
     uint32_t lastYieldMs;
-    bool aborted = false;
-    bool writeFailed = false;
 
    public:
     explicit AbortingFilePrint(HalFile& f) : file(f), lastYieldMs(millis()) {}
-    bool wasAborted() const { return aborted; }
-    bool hasWriteError() const { return writeFailed; }
     size_t write(uint8_t b) override { return write(&b, 1); }
     size_t write(const uint8_t* buf, size_t size) override {
       if (ImageToFramebufferDecoder::isAborted()) {
-        aborted = true;
         return 0;
       }
       ImageToFramebufferDecoder::yieldDuringDecode(lastYieldMs);
       if (ImageToFramebufferDecoder::isAborted()) {
-        aborted = true;
         return 0;
       }
-      const size_t written = file.write(buf, size);
-      if (written != size) {
-        writeFailed = true;
-      }
-      return written;
+      return file.write(buf, size);
     }
   };
   AbortingFilePrint sink(out);
   // Large images dominate lazy extraction. Match the section streamer size to
   // halve SD read/write calls while adding only 8 KB of transient ZIP buffers.
-  const bool streamOk = readItemContentsToStream(itemHref, sink, 8192, /*allowEarlyStop=*/true);
+  const bool streamOk = readItemContentsToStream(itemHref, sink, 8192);
   out.flush();
   const bool closedOk = out.close();
-  bool ok = streamOk && !sink.wasAborted() && !sink.hasWriteError() && closedOk;
+  bool ok = streamOk && closedOk && !ImageToFramebufferDecoder::isAborted();
   if (ok) {
     ok = Storage.replaceFile(tmpPath.c_str(), destPath.c_str());
   }

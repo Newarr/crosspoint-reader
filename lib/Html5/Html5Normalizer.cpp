@@ -28,19 +28,16 @@ SOFTWARE.
 #include <HalStorage.h>
 #include <Memory.h>
 
-#include <algorithm>
 #include <cctype>
 #include <string_view>
+
+#include "Html5Markup.h"
 
 namespace html5 {
 
 namespace {
 
-constexpr const char* VOID_ELEMENTS[] = {"img",  "br",  "hr",    "input", "meta",   "link",  "area",
-                                         "base", "col", "embed", "param", "source", "track", "wbr"};
-constexpr size_t VOID_ELEMENT_COUNT = sizeof(VOID_ELEMENTS) / sizeof(VOID_ELEMENTS[0]);
 constexpr size_t MAX_TAG_NAME_LENGTH = 8;
-constexpr size_t MAX_ATTR_NAME_LENGTH = 32;
 constexpr size_t BUFFER_SIZE = 1024;
 
 enum class State : uint8_t {
@@ -52,30 +49,57 @@ enum class State : uint8_t {
   InUnquotedValue,
   InQuote,
   InClosingTagName,
-  InClosingTagRest,
-  Declaration,
-  Comment,
-  Cdata,
-  Instruction
+  InClosingTagRest
 };
 
-char toLowerAscii(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c; }
+enum class ReferenceStatus : uint8_t { Pending, Valid, Invalid };
 
-bool isVoidElement(const char* name, size_t len) {
-  for (size_t i = 0; i < VOID_ELEMENT_COUNT; i++) {
-    const char* ve = VOID_ELEMENTS[i];
-    size_t veLen = 0;
-    while (ve[veLen] != '\0') veLen++;
-    if (len == veLen) {
-      bool match = true;
-      for (size_t j = 0; j < len && match; j++) {
-        if (toLowerAscii(name[j]) != ve[j]) match = false;
-      }
-      if (match) return true;
+class EntityReference {
+ public:
+  ReferenceStatus consume(char c) {
+    switch (state) {
+      case State::Start:
+        if (c == '#') {
+          state = State::NumericStart;
+          return ReferenceStatus::Pending;
+        }
+        if (!isNameStart(c)) return ReferenceStatus::Invalid;
+        state = State::Named;
+        return ReferenceStatus::Pending;
+      case State::Named:
+        if (c == ';') return ReferenceStatus::Valid;
+        return isNameStart(c) || isDigit(c) || c == '.' || c == '-' ? ReferenceStatus::Pending
+                                                                    : ReferenceStatus::Invalid;
+      case State::NumericStart:
+        if (c == 'x') {
+          state = State::Hex;
+          return ReferenceStatus::Pending;
+        }
+        state = State::Decimal;
+        break;
+      case State::Decimal:
+      case State::Hex:
+        break;
     }
+
+    if (c == ';') return haveDigit ? ReferenceStatus::Valid : ReferenceStatus::Invalid;
+    const char lower = lowerAscii(c);
+    if (!isDigit(c) && !(state == State::Hex && lower >= 'a' && lower <= 'f')) return ReferenceStatus::Invalid;
+    haveDigit = true;
+    return ReferenceStatus::Pending;
   }
-  return false;
-}
+
+ private:
+  enum class State : uint8_t { Start, Named, NumericStart, Decimal, Hex };
+  State state = State::Start;
+  bool haveDigit = false;
+
+  static bool isDigit(char c) { return c >= '0' && c <= '9'; }
+  static bool isNameStart(char c) {
+    const char lower = lowerAscii(c);
+    return (lower >= 'a' && lower <= 'z') || c == '_' || c == ':' || static_cast<uint8_t>(c) >= 0x80;
+  }
+};
 
 bool isAttrNameStart(char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_'; }
 
@@ -99,7 +123,10 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
   auto* writeBuffer = readBuffer + BUFFER_SIZE;
 
   HalFile inFile, outFile;
-  if (!Storage.openFileForRead("H5N", inputPath, inFile) || !Storage.openFileForWrite("H5N", outputPath, outFile)) {
+  if (!Storage.openFileForRead("H5N", inputPath, inFile)) return NormalizeResult::Error;
+  if (!Storage.openFileForWrite("H5N", outputPath, outFile)) {
+    if (outFile.isOpen()) outFile.close();
+    Storage.remove(outputPath.c_str());
     return NormalizeResult::Error;
   }
 
@@ -111,14 +138,8 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
   bool isCurrentTagVoid = false;
   char quoteChar = 0;
   char prevChar = 0;
-  char beforePrevChar = 0;
-  size_t declarationPrefixLength = 0;
-  bool commentPrefix = false;
-  bool cdataPrefix = false;
-  bool inSubset = false;
+  OpaqueMarkup opaque;
 
-  char attrNameBuf[MAX_ATTR_NAME_LENGTH + 1] = {0};
-  size_t attrNameLen = 0;
   bool inAttrName = false;
   bool afterAttrName = false;
 
@@ -149,27 +170,43 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
     return true;
   };
 
-  auto flushBareAttr = [&]() -> bool {
-    for (size_t j = 0; j < attrNameLen; j++) {
-      if (!writeChar(attrNameBuf[j])) return false;
+  const auto writeText = [&](std::string_view text) {
+    for (const char c : text) {
+      if (!writeChar(c)) return false;
     }
-    if (!writeChar('=')) return false;
-    if (!writeChar('"')) return false;
-    if (!writeChar('"')) return false;
-    attrNameLen = 0;
-    inAttrName = false;
-    afterAttrName = false;
     return true;
   };
 
-  auto flushAttrNameRaw = [&]() -> bool {
-    for (size_t j = 0; j < attrNameLen; j++) {
-      if (!writeChar(attrNameBuf[j])) return false;
+  const auto writeValueChar = [&](char c, const uint8_t* next, const uint8_t* end) {
+    if (c != '&') return writeChar(c);
+    EntityReference reference;
+    auto status = ReferenceStatus::Pending;
+    while (next != end && status == ReferenceStatus::Pending) {
+      status = reference.consume(static_cast<char>(*next++));
     }
-    attrNameLen = 0;
+    if (status == ReferenceStatus::Pending && remaining > 0) {
+      if (!flushWrite()) return false;
+      const auto resume = inFile.position();
+      size_t left = remaining;
+      while (left > 0 && status == ReferenceStatus::Pending) {
+        if (aborted()) return false;
+        const size_t wanted = left < BUFFER_SIZE ? left : BUFFER_SIZE;
+        const int read = inFile.read(writeBuffer, wanted);
+        if (read <= 0 || static_cast<size_t>(read) > wanted) return false;
+        left -= static_cast<size_t>(read);
+        for (int i = 0; i < read && status == ReferenceStatus::Pending; ++i) {
+          status = reference.consume(static_cast<char>(writeBuffer[i]));
+        }
+      }
+      if (!inFile.seek(resume)) return false;
+    }
+    return status == ReferenceStatus::Valid ? writeChar('&') : writeText("&amp;");
+  };
+
+  const auto finishAttr = [&](bool hasValue) {
     inAttrName = false;
     afterAttrName = false;
-    return true;
+    return hasValue || writeText("=\"\"");
   };
 
   auto closeCurrentTag = [&]() -> bool {
@@ -187,7 +224,13 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
     remaining -= static_cast<size_t>(bytesRead);
 
     for (int i = 0; i < bytesRead; i++) {
-      char c = static_cast<char>(readBuffer[i]);
+      const char c = static_cast<char>(readBuffer[i]);
+      if (opaque.active()) {
+        opaque.consume(c);
+        if (!writeChar(c)) goto error;
+        continue;
+      }
+      const auto writeValue = [&] { return writeValueChar(c, readBuffer + i + 1, readBuffer + bytesRead); };
 
       switch (state) {
         case State::Normal:
@@ -195,8 +238,8 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             state = State::InTagStart;
             tagNameLen = 0;
             isCurrentTagVoid = false;
-          } else {
-            if (!writeChar(c)) goto error;
+          } else if (!writeValue()) {
+            goto error;
           }
           break;
 
@@ -205,12 +248,8 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             state = State::InClosingTagName;
             tagNameLen = 0;
             closingTagWsLen = 0;
-          } else if (c == '!' || c == '?') {
-            state = c == '!' ? State::Declaration : State::Instruction;
-            declarationPrefixLength = 0;
-            commentPrefix = cdataPrefix = true;
-            inSubset = false;
-            quoteChar = 0;
+          } else if (opaque.start(c)) {
+            state = State::Normal;
             if (!writeChar('<') || !writeChar(c)) goto error;
           } else if (std::isalpha(static_cast<unsigned char>(c))) {
             state = State::InTagName;
@@ -234,25 +273,19 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             }
             if (!writeChar(c)) goto error;
           } else {
-            isCurrentTagVoid = isVoidElement(tagName, tagNameLen);
+            isCurrentTagVoid = isVoidElement({tagName, tagNameLen});
 
             if (c == '>') {
-              if (isCurrentTagVoid && prevChar != '/') {
-                if (!writeChar(' ')) goto error;
-                if (!writeChar('/')) goto error;
-              }
-              if (!writeChar(c)) goto error;
+              if (!closeCurrentTag()) goto error;
               state = State::Normal;
             } else if (std::isspace(static_cast<unsigned char>(c))) {
               state = State::InTagAttrs;
               inAttrName = false;
-              attrNameLen = 0;
               if (!writeChar(c)) goto error;
             } else if (c == '/') {
               if (!writeChar(c)) goto error;
               state = State::InTagAttrs;
               inAttrName = false;
-              attrNameLen = 0;
             } else {
               if (!writeChar(c)) goto error;
               state = State::Normal;
@@ -263,45 +296,39 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
         case State::InTagAttrs:
           if (c == '"' || c == '\'') {
             if (inAttrName) {
-              if (!flushBareAttr()) goto error;
+              if (!finishAttr(false)) goto error;
             }
             state = State::InQuote;
             quoteChar = c;
             if (!writeChar(c)) goto error;
           } else if (c == '=') {
-            if (!flushAttrNameRaw() || !writeChar(c)) goto error;
+            if (!finishAttr(true) || !writeChar(c)) goto error;
             state = State::BeforeValue;
           } else if (c == '>') {
             if (inAttrName) {
-              if (!flushBareAttr()) goto error;
+              if (!finishAttr(false)) goto error;
             }
             if (!closeCurrentTag()) goto error;
             state = State::Normal;
           } else if (c == '<') {
             if (inAttrName) {
-              if (!flushBareAttr()) goto error;
+              if (!finishAttr(false)) goto error;
             }
             if (!closeCurrentTag()) goto error;
             state = State::InTagStart;
             tagNameLen = 0;
             isCurrentTagVoid = false;
           } else if (isAttrNameStart(c) && (!inAttrName || afterAttrName)) {
-            if (afterAttrName && (!flushBareAttr() || !writeChar(' '))) goto error;
+            if (afterAttrName && (!finishAttr(false) || !writeChar(' '))) goto error;
             if (prevChar == '"' || prevChar == '\'') {
               if (!writeChar(' ')) goto error;
             }
             inAttrName = true;
-            attrNameLen = 0;
-            attrNameBuf[attrNameLen++] = c;
+            if (!writeChar(c)) goto error;
           } else if (inAttrName && isAttrNameChar(c)) {
-            if (attrNameLen == MAX_ATTR_NAME_LENGTH) {
-              if (!writeChar(attrNameBuf[0])) goto error;
-              std::move(attrNameBuf + 1, attrNameBuf + attrNameLen, attrNameBuf);
-              --attrNameLen;
-            }
-            attrNameBuf[attrNameLen++] = c;
+            if (!writeChar(c)) goto error;
           } else if (c == '/') {
-            if (inAttrName && !flushBareAttr()) goto error;
+            if (inAttrName && !finishAttr(false)) goto error;
             if (!writeChar(c)) goto error;
           } else if (std::isspace(static_cast<unsigned char>(c))) {
             if (inAttrName) {
@@ -311,7 +338,7 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             }
           } else {
             if (inAttrName) {
-              if (!flushAttrNameRaw()) goto error;
+              if (!finishAttr(true)) goto error;
             }
             if (!writeChar(c)) goto error;
           }
@@ -328,7 +355,7 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             if (!writeChar('"') || !writeChar('"') || !closeCurrentTag()) goto error;
             state = c == '>' ? State::Normal : State::InTagStart;
           } else {
-            if (!writeChar('"') || !writeChar(c)) goto error;
+            if (!writeChar('"') || !writeValue()) goto error;
             state = State::InUnquotedValue;
           }
           break;
@@ -346,7 +373,7 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             for (char ch : std::string_view("&quot;")) {
               if (!writeChar(ch)) goto error;
             }
-          } else if (!writeChar(c)) {
+          } else if (!writeValue()) {
             goto error;
           }
           break;
@@ -355,15 +382,14 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
           if (c == quoteChar) {
             state = State::InTagAttrs;
             inAttrName = false;
-            attrNameLen = 0;
             if (!writeChar(c)) goto error;
           } else if (c == '<') {
             if (!writeChar('&')) goto error;
             if (!writeChar('l')) goto error;
             if (!writeChar('t')) goto error;
             if (!writeChar(';')) goto error;
-          } else {
-            if (!writeChar(c)) goto error;
+          } else if (!writeValue()) {
+            goto error;
           }
           break;
 
@@ -382,7 +408,7 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
             }
           } else if (c == '>') {
             tagName[tagNameLen] = '\0';
-            if (isVoidElement(tagName, tagNameLen)) {
+            if (isVoidElement({tagName, tagNameLen})) {
               // Skip closing tag for void elements
             } else {
               if (!writeChar('<')) goto error;
@@ -415,51 +441,15 @@ NormalizeResult normalizeHtmlForXml(const std::string& inputPath, const std::str
           if (!writeChar(c)) goto error;
           if (c == '>') state = State::Normal;
           break;
-
-        case State::Declaration:
-          if (!writeChar(c)) goto error;
-          if (commentPrefix || cdataPrefix) {
-            commentPrefix = commentPrefix && c == "--"[declarationPrefixLength];
-            cdataPrefix = cdataPrefix && c == "[CDATA["[declarationPrefixLength];
-            ++declarationPrefixLength;
-            if (commentPrefix && declarationPrefixLength == 2) {
-              state = State::Comment;
-            } else if (cdataPrefix && declarationPrefixLength == 7) {
-              state = State::Cdata;
-            }
-            if (commentPrefix || cdataPrefix) break;
-          }
-          if (quoteChar) {
-            if (c == quoteChar) quoteChar = 0;
-          } else if (c == '\'' || c == '"') {
-            quoteChar = c;
-          } else if (c == '[' || c == ']') {
-            inSubset = c == '[';
-          } else if (c == '>' && !inSubset) {
-            state = State::Normal;
-          }
-          break;
-
-        case State::Comment:
-        case State::Cdata:
-        case State::Instruction: {
-          if (!writeChar(c)) goto error;
-          const char delimiter = state == State::Comment ? '-' : state == State::Cdata ? ']' : '?';
-          if (c == '>' && prevChar == delimiter && (state == State::Instruction || beforePrevChar == delimiter)) {
-            state = State::Normal;
-          }
-          break;
-        }
       }
 
-      beforePrevChar = prevChar;
       prevChar = c;
     }
   }
 
   if (state == State::InTagAttrs || state == State::InTagName) {
     if (inAttrName) {
-      if (!flushBareAttr()) goto error;
+      if (!finishAttr(false)) goto error;
     }
     if (!closeCurrentTag()) goto error;
   } else if (state == State::BeforeValue || state == State::InUnquotedValue || state == State::InQuote) {

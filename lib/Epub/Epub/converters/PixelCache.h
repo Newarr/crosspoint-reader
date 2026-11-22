@@ -62,8 +62,7 @@ struct PixelCache {
 
   // Open the cache file, write the header, and allocate a band buffer big enough
   // to hold the tallest single decode block (maxBlockDstRows output rows).
-  bool begin(const std::string& cachePath, int w, int h, int ox, int oy, int maxBlockDstRows,
-             PixelCacheLayout layout = PixelCacheLayout::PackedRows, bool useBilinear = true) {
+  bool begin(const std::string& cachePath, int w, int h, int ox, int oy, int maxBlockDstRows) {
     if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) return false;
     width = w;
     height = h;
@@ -108,13 +107,9 @@ struct PixelCache {
     }
     cachePathStr = cachePath;
 
-    const PixelCacheHeader header{PXC_MAGIC, PXC_VERSION, static_cast<uint8_t>(useBilinear), static_cast<uint16_t>(w),
+    const PixelCacheHeader header{PXC_MAGIC, PXC_VERSION, PXC_V1_SCALING, static_cast<uint16_t>(w),
                                   static_cast<uint16_t>(h)};
-    const bool headerWritten = layout == PixelCacheLayout::Versioned
-                                   ? file.write(&header, sizeof(header)) == sizeof(header)
-                                   : file.write(&header.width, sizeof(header.width)) == sizeof(header.width) &&
-                                         file.write(&header.height, sizeof(header.height)) == sizeof(header.height);
-    if (!headerWritten) {
+    if (file.write(&header, sizeof(header)) != sizeof(header)) {
       LOG_ERR("IMG", "Failed to write cache header: %s", cachePath.c_str());
       abort();
       return false;

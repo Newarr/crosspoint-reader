@@ -1,6 +1,10 @@
 #include "ChapterXPathResolver.h"
 
 #include <Epub/VisibleTextUtils.h>
+#include <Epub/parsers/ChapterXmlEntities.h>
+#include <Epub/parsers/DataUriStripper.h>
+#include <HalStorage.h>
+#include <Html5Normalizer.h>
 #include <Logging.h>
 #include <Print.h>
 #include <Utf8.h>
@@ -10,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,10 +94,76 @@ size_t countUtf8Codepoints(const XML_Char* data, const int len) {
   return count;
 }
 
-class ParagraphTextCounter final : public Print {
+class ChapterXmlParser : public Print {
+ public:
+  ~ChapterXmlParser() override { destroyXmlParser(parser); }
+
+  bool ok() const { return parser && error == XML_ERROR_NONE; }
+  bool needsNormalization() const { return error != XML_ERROR_NONE && error != XML_ERROR_NO_MEMORY; }
+
+  bool finish() {
+    if (ok() && !finished) recordStatus(XML_Parse(parser, "", 0, XML_TRUE));
+    return ok();
+  }
+
+  size_t write(uint8_t c) override { return write(&c, 1); }
+
+  size_t write(const uint8_t* buffer, size_t size) override {
+    if (!ok() || finished || size == 0) return size;
+    auto* xml = static_cast<char*>(XML_GetBuffer(parser, static_cast<int>(size)));
+    if (!xml) {
+      error = XML_ERROR_NO_MEMORY;
+      return size;
+    }
+    int written = 0;
+    for (size_t i = 0; i < size; ++i) {
+      const char c = static_cast<char>(buffer[i]);
+      if (filter.keep(c)) xml[written++] = c;
+    }
+    recordStatus(XML_ParseBuffer(parser, written, XML_FALSE));
+    return size;
+  }
+
+ protected:
+  XML_Parser parser = XML_ParserCreate(nullptr);
+  bool matched = false;
+  int depth = 0;
+
+  std::string closeElement(const XML_Char* rawName) {
+    --depth;
+    if (depth != 0 && matched) return {};
+    auto name = stripPrefix(rawName);
+    if (depth == 0 && name == "html") htmlEnded = true;
+    return name;
+  }
+
+  template <XML_CharacterDataHandler Consume>
+  static void XMLCALL defaultHandlerExpand(void* userData, const XML_Char* data, int len) {
+    const auto text = chapterXmlEntityText({data, static_cast<size_t>(len)});
+    if (!text.empty()) Consume(userData, text.data(), static_cast<int>(text.size()));
+  }
+
+ private:
+  XML_Error error = XML_ERROR_NONE;
+  ImageDataUriFilter filter;
+  bool htmlEnded = false;
+  bool finished = false;
+
+  void recordStatus(XML_Status status) {
+    if (status != XML_STATUS_ERROR || finished) return;
+    const auto parseError = XML_GetErrorCode(parser);
+    if (htmlEnded && parseError != XML_ERROR_NO_MEMORY) {
+      finished = true;
+      return;
+    }
+    error = parseError;
+    LOG_ERR("KOX", "XML parse error: %s", XML_ErrorString(error));
+  }
+};
+
+class ParagraphTextCounter final : public ChapterXmlParser {
  public:
   ParagraphTextCounter() {
-    parser = XML_ParserCreate(nullptr);
     if (!parser) {
       LOG_ERR("KOX", "Failed to create XML parser");
       return;
@@ -101,40 +172,7 @@ class ParagraphTextCounter final : public Print {
     XML_SetUserData(parser, this);
     XML_SetElementHandler(parser, &ParagraphTextCounter::startElement, &ParagraphTextCounter::endElement);
     XML_SetCharacterDataHandler(parser, &ParagraphTextCounter::characterData);
-  }
-
-  ~ParagraphTextCounter() override { destroyXmlParser(parser); }
-
-  bool ok() const { return parser != nullptr && parseOk; }
-
-  bool finish() {
-    if (!parser || !parseOk || stopped) {
-      return parseOk;
-    }
-
-    if (XML_Parse(parser, "", 0, XML_TRUE) == XML_STATUS_ERROR) {
-      LOG_ERR("KOX", "Final XML parse error: %s", XML_ErrorString(XML_GetErrorCode(parser)));
-      parseOk = false;
-    }
-    return parseOk;
-  }
-
-  size_t write(uint8_t c) override { return write(&c, 1); }
-
-  size_t write(const uint8_t* buffer, size_t size) override {
-    if (!parser || !parseOk || stopped) {
-      return size;
-    }
-
-    if (XML_Parse(parser, reinterpret_cast<const char*>(buffer), static_cast<int>(size), XML_FALSE) != XML_STATUS_OK) {
-      const enum XML_Error error = XML_GetErrorCode(parser);
-      if (error != XML_ERROR_ABORTED) {
-        LOG_ERR("KOX", "XML parse error: %s", XML_ErrorString(error));
-        parseOk = false;
-      }
-    }
-
-    return size;
+    XML_SetDefaultHandlerExpand(parser, &defaultHandlerExpand<&ParagraphTextCounter::characterData>);
   }
 
   // Visible codepoints up to the end of the last non-whitespace run. Trailing formatting
@@ -176,9 +214,8 @@ class ParagraphTextCounter final : public Print {
   }
 
   void onEndElement(const XML_Char* rawName) {
-    const std::string name = stripPrefix(rawName);
+    const std::string name = closeElement(rawName);
 
-    depth--;
     if (!insideBody) {
       return;
     }
@@ -211,21 +248,16 @@ class ParagraphTextCounter final : public Print {
   }
 
  private:
-  XML_Parser parser = nullptr;
-  bool parseOk = true;
   bool insideBody = false;
-  bool stopped = false;
-  int depth = 0;
   int bodyDepth = -1;
   uint16_t nonVisibleDepth = 0;
   size_t visibleChars = 0;
   size_t lastTextEndChars = 0;
 };
 
-class XPathParagraphResolver final : public Print {
+class XPathParagraphResolver final : public ChapterXmlParser {
  public:
   explicit XPathParagraphResolver(const int targetParagraph) : targetParagraph(targetParagraph) {
-    parser = XML_ParserCreate(nullptr);
     if (!parser) {
       LOG_ERR("KOX", "Failed to create XML parser");
       return;
@@ -235,42 +267,7 @@ class XPathParagraphResolver final : public Print {
     XML_SetElementHandler(parser, &XPathParagraphResolver::startElement, &XPathParagraphResolver::endElement);
   }
 
-  ~XPathParagraphResolver() override { destroyXmlParser(parser); }
-
-  bool ok() const { return parser != nullptr && parseOk; }
-
-  bool finish() {
-    if (!parser || !parseOk || stopped) {
-      return parseOk;
-    }
-
-    if (XML_Parse(parser, "", 0, XML_TRUE) == XML_STATUS_ERROR) {
-      LOG_ERR("KOX", "Final XML parse error: %s", XML_ErrorString(XML_GetErrorCode(parser)));
-      parseOk = false;
-    }
-    return parseOk;
-  }
-
-  bool hasMatch() const { return !xpath.empty(); }
   const std::string& getXPath() const { return xpath; }
-
-  size_t write(uint8_t c) override { return write(&c, 1); }
-
-  size_t write(const uint8_t* buffer, size_t size) override {
-    if (!parser || !parseOk || stopped) {
-      return size;
-    }
-
-    if (XML_Parse(parser, reinterpret_cast<const char*>(buffer), static_cast<int>(size), XML_FALSE) != XML_STATUS_OK) {
-      const enum XML_Error error = XML_GetErrorCode(parser);
-      if (error != XML_ERROR_ABORTED) {
-        LOG_ERR("KOX", "XML parse error: %s", XML_ErrorString(error));
-        parseOk = false;
-      }
-    }
-
-    return size;
-  }
 
   int spineIndex = 0;
 
@@ -286,6 +283,10 @@ class XPathParagraphResolver final : public Print {
   }
 
   void onStartElement(const XML_Char* rawName) {
+    if (matched) {
+      ++depth;
+      return;
+    }
     const std::string name = stripPrefix(rawName);
 
     if (!insideBody) {
@@ -312,18 +313,16 @@ class XPathParagraphResolver final : public Print {
     }
     if (paragraphCount == targetParagraph) {
       xpath = buildParagraphXPath(spineIndex, path, 0, 0);
-      stopped = true;
-      XML_StopParser(parser, XML_FALSE);
+      matched = true;
     }
 
     depth++;
   }
 
   void onEndElement(const XML_Char* rawName) {
-    const std::string name = stripPrefix(rawName);
+    const std::string name = closeElement(rawName);
 
-    depth--;
-    if (!insideBody) {
+    if (matched || !insideBody) {
       return;
     }
 
@@ -342,12 +341,8 @@ class XPathParagraphResolver final : public Print {
     }
   }
 
-  XML_Parser parser = nullptr;
   const int targetParagraph;
-  bool parseOk = true;
   bool insideBody = false;
-  bool stopped = false;
-  int depth = 0;
   int bodyDepth = -1;
   int paragraphCount = 0;
   std::vector<ParentState> parentStates;
@@ -355,14 +350,13 @@ class XPathParagraphResolver final : public Print {
   std::string xpath;
 };
 
-class XPathProgressResolver final : public Print {
+class XPathProgressResolver final : public ChapterXmlParser {
  public:
   enum class BoundaryMode { Exclusive, Inclusive };
 
   explicit XPathProgressResolver(const size_t targetVisibleChar,
                                  const BoundaryMode boundaryMode = BoundaryMode::Exclusive)
       : targetVisibleChar(targetVisibleChar), boundaryMode(boundaryMode) {
-    parser = XML_ParserCreate(nullptr);
     if (!parser) {
       LOG_ERR("KOX", "Failed to create XML parser");
       return;
@@ -371,48 +365,14 @@ class XPathProgressResolver final : public Print {
     XML_SetUserData(parser, this);
     XML_SetElementHandler(parser, &XPathProgressResolver::startElement, &XPathProgressResolver::endElement);
     XML_SetCharacterDataHandler(parser, &XPathProgressResolver::characterData);
+    XML_SetDefaultHandlerExpand(parser, &defaultHandlerExpand<&XPathProgressResolver::characterData>);
     XML_SetCommentHandler(parser, &XPathProgressResolver::comment);
     XML_SetProcessingInstructionHandler(parser, &XPathProgressResolver::processingInstruction);
     XML_SetCdataSectionHandler(parser, &XPathProgressResolver::startCdataSection,
                                &XPathProgressResolver::endCdataSection);
   }
 
-  ~XPathProgressResolver() override { destroyXmlParser(parser); }
-
-  bool ok() const { return parser != nullptr && parseOk; }
-
-  bool finish() {
-    if (!parser || !parseOk || stopped) {
-      return parseOk;
-    }
-
-    if (XML_Parse(parser, "", 0, XML_TRUE) == XML_STATUS_ERROR) {
-      LOG_ERR("KOX", "Final XML parse error: %s", XML_ErrorString(XML_GetErrorCode(parser)));
-      parseOk = false;
-    }
-    return parseOk;
-  }
-
-  bool hasMatch() const { return !xpath.empty(); }
   const std::string& getXPath() const { return xpath; }
-
-  size_t write(uint8_t c) override { return write(&c, 1); }
-
-  size_t write(const uint8_t* buffer, size_t size) override {
-    if (!parser || !parseOk || stopped) {
-      return size;
-    }
-
-    if (XML_Parse(parser, reinterpret_cast<const char*>(buffer), static_cast<int>(size), XML_FALSE) != XML_STATUS_OK) {
-      const enum XML_Error error = XML_GetErrorCode(parser);
-      if (error != XML_ERROR_ABORTED) {
-        LOG_ERR("KOX", "XML parse error: %s", XML_ErrorString(error));
-        parseOk = false;
-      }
-    }
-
-    return size;
-  }
 
   int spineIndex = 0;
 
@@ -453,6 +413,10 @@ class XPathProgressResolver final : public Print {
   }
 
   void onStartElement(const XML_Char* rawName) {
+    if (matched) {
+      ++depth;
+      return;
+    }
     const std::string name = stripPrefix(rawName);
 
     if (!insideBody) {
@@ -480,10 +444,9 @@ class XPathProgressResolver final : public Print {
   }
 
   void onEndElement(const XML_Char* rawName) {
-    const std::string name = stripPrefix(rawName);
+    const std::string name = closeElement(rawName);
 
-    depth--;
-    if (!insideBody) {
+    if (matched || !insideBody) {
       return;
     }
 
@@ -516,7 +479,7 @@ class XPathProgressResolver final : public Print {
   // codepoint outside non-visible elements), so offsets recorded by the page LUT line up
   // with what is counted here regardless of which elements hold the text.
   void onCharacterData(const XML_Char* data, const int len) {
-    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped) {
+    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || matched) {
       return;
     }
 
@@ -551,8 +514,7 @@ class XPathProgressResolver final : public Print {
       const int texNode = textNodeIndexStack.empty() ? 0 : textNodeIndexStack.back();
       const size_t charOff = visibleChars - textNodeStartChars + delta;
       xpath = buildParagraphXPath(spineIndex, path, texNode, charOff);
-      stopped = true;
-      XML_StopParser(parser, XML_FALSE);
+      matched = true;
       return;
     }
 
@@ -560,21 +522,17 @@ class XPathProgressResolver final : public Print {
   }
 
   void onMarkupBoundary() {
-    if (!insideBody || nonVisibleDepth > 0 || stopped) {
+    if (!insideBody || nonVisibleDepth > 0 || matched) {
       return;
     }
 
     pendingTextNode = true;
   }
 
-  XML_Parser parser = nullptr;
   const size_t targetVisibleChar;
   const BoundaryMode boundaryMode;
-  bool parseOk = true;
   bool insideBody = false;
-  bool stopped = false;
   bool pendingTextNode = true;
-  int depth = 0;
   int bodyDepth = -1;
   uint16_t nonVisibleDepth = 0;
   size_t visibleChars = 0;
@@ -584,6 +542,60 @@ class XPathProgressResolver final : public Print {
   std::vector<PathSegment> path;
   std::string xpath;
 };
+enum class ChapterParseResult { Ok, SyntaxError, Error };
+
+std::mutex normalizationMutex;
+
+class ChapterXmlInput {
+ public:
+  ChapterXmlInput(const Epub& epub, const std::string& href) : epub(epub), href(href) {}
+  ~ChapterXmlInput() {
+    if (!normalizedPath.empty()) Storage.remove(normalizedPath.c_str());
+  }
+
+  ChapterParseResult parse(ChapterXmlParser& parser) const {
+    if (!parser.ok()) return ChapterParseResult::Error;
+    const bool read = normalizedPath.empty() ? epub.readItemContentsToStream(href, parser, 1024)
+                                             : Storage.readFileToStream(normalizedPath.c_str(), parser);
+    if (!read) return ChapterParseResult::Error;
+    if (parser.finish()) return ChapterParseResult::Ok;
+    return parser.needsNormalization() ? ChapterParseResult::SyntaxError : ChapterParseResult::Error;
+  }
+
+  bool normalize() {
+    lock.lock();
+    const auto rawPath = epub.getCachePath() + "/.koreader-chapter.html";
+    normalizedPath = epub.getCachePath() + "/.koreader-chapter.xml";
+    HalFile raw;
+    if (!Storage.openFileForWrite("KOX", rawPath, raw)) {
+      Storage.remove(rawPath.c_str());
+      return false;
+    }
+    const bool streamed = epub.readItemContentsToStream(href, raw, 1024);
+    const bool closed = raw.close();
+    const bool normalized =
+        streamed && closed && html5::normalizeHtmlForXml(rawPath, normalizedPath) == html5::NormalizeResult::Ok;
+    Storage.remove(rawPath.c_str());
+    return normalized;
+  }
+
+ private:
+  const Epub& epub;
+  const std::string& href;
+  std::string normalizedPath;
+  std::unique_lock<std::mutex> lock{normalizationMutex, std::defer_lock};
+};
+
+template <typename Resolve>
+auto parseChapter(ChapterXmlInput& input, const Resolve& resolve) {
+  auto [result, value] = resolve();
+  if (result == ChapterParseResult::SyntaxError && input.normalize()) {
+    auto [repairedResult, repairedValue] = resolve();
+    if (repairedResult == ChapterParseResult::Ok) return repairedValue;
+  }
+  return result == ChapterParseResult::Ok ? value : decltype(value){};
+}
+
 }  // namespace
 
 std::string ChapterXPathResolver::findXPathForParagraph(const std::shared_ptr<Epub>& epub, const int spineIndex,
@@ -597,23 +609,13 @@ std::string ChapterXPathResolver::findXPathForParagraph(const std::shared_ptr<Ep
     return "";
   }
 
-  XPathParagraphResolver resolver(paragraphIndex);
-  if (!resolver.ok()) {
-    return "";
-  }
-
-  resolver.spineIndex = spineIndex;
-  if (!epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish()) {
-    return "";
-  }
-
-  if (resolver.hasMatch()) {
-    LOG_DBG("KOX", "Resolved paragraph %u in spine %d -> %s", paragraphIndex, spineIndex, resolver.getXPath().c_str());
-    return resolver.getXPath();
-  }
-
-  LOG_DBG("KOX", "Paragraph %u not found in spine %d", paragraphIndex, spineIndex);
-  return "";
+  ChapterXmlInput input(*epub, href);
+  return parseChapter(input, [&] {
+    XPathParagraphResolver resolver(paragraphIndex);
+    resolver.spineIndex = spineIndex;
+    const auto result = input.parse(resolver);
+    return std::pair{result, resolver.getXPath()};
+  });
 }
 
 std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::shared_ptr<Epub>& epub, const int spineIndex,
@@ -627,24 +629,13 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
     return "";
   }
 
-  XPathProgressResolver resolver(visibleTextOffset);
-  if (!resolver.ok()) {
-    return "";
-  }
-
-  resolver.spineIndex = spineIndex;
-  if (!epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish()) {
-    return "";
-  }
-
-  if (resolver.hasMatch()) {
-    LOG_DBG("KOX", "Resolved visible offset %u in spine %d -> %s", visibleTextOffset, spineIndex,
-            resolver.getXPath().c_str());
-    return resolver.getXPath();
-  }
-
-  LOG_DBG("KOX", "Visible offset %u not found in spine %d", visibleTextOffset, spineIndex);
-  return "";
+  ChapterXmlInput input(*epub, href);
+  return parseChapter(input, [&] {
+    XPathProgressResolver resolver(visibleTextOffset);
+    resolver.spineIndex = spineIndex;
+    const auto result = input.parse(resolver);
+    return std::pair{result, resolver.getXPath()};
+  });
 }
 
 std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epub>& epub, const int spineIndex,
@@ -662,36 +653,19 @@ std::string ChapterXPathResolver::findXPathForProgress(const std::shared_ptr<Epu
     return "/body/DocFragment[" + std::to_string(spineIndex + 1) + "]/body";
   }
 
-  ParagraphTextCounter counter;
-  if (!counter.ok() || !epub->readItemContentsToStream(href, counter, 1024) || !counter.finish()) {
-    return "";
-  }
-
-  const size_t totalVisibleChars = counter.totalVisibleChars();
-  if (totalVisibleChars == 0) {
-    return "";
-  }
+  ChapterXmlInput input(*epub, href);
+  const auto totalVisibleChars = parseChapter(input, [&] {
+    ParagraphTextCounter counter;
+    const auto result = input.parse(counter);
+    return std::pair{result, counter.totalVisibleChars()};
+  });
+  if (totalVisibleChars == 0) return "";
 
   const float clamped = std::max(0.0f, std::min(1.0f, intraSpineProgress));
   const size_t targetVisibleChar =
       std::max<size_t>(1, std::min(totalVisibleChars, static_cast<size_t>(std::ceil(clamped * totalVisibleChars))));
 
   XPathProgressResolver resolver(targetVisibleChar, XPathProgressResolver::BoundaryMode::Inclusive);
-  if (!resolver.ok()) {
-    return "";
-  }
-
   resolver.spineIndex = spineIndex;
-  if (!epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish()) {
-    return "";
-  }
-
-  if (resolver.hasMatch()) {
-    LOG_DBG("KOX", "Resolved progress %.3f in spine %d -> %s", intraSpineProgress, spineIndex,
-            resolver.getXPath().c_str());
-    return resolver.getXPath();
-  }
-
-  LOG_DBG("KOX", "Could not resolve progress %.3f in spine %d", intraSpineProgress, spineIndex);
-  return "";
+  return input.parse(resolver) == ChapterParseResult::Ok ? resolver.getXPath() : "";
 }

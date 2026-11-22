@@ -5,11 +5,15 @@
 #include <memory>
 #include <string>
 
+#include "ProgressFile.h"
 #include "ReaderActivity.h"
 
 class XtcReaderActivity final : public ReaderActivity {
   std::shared_ptr<Xtc> xtc;
   uint32_t currentPage = 0;
+  ProgressFile::Version progressVersion;
+  uint32_t savedPage = 0;
+  bool canSaveProgress = false;
 
   enum class StatusBarOverlayPosition { Bottom, Top };
   struct StatusBarInfo {
@@ -22,7 +26,7 @@ class XtcReaderActivity final : public ReaderActivity {
   void openChapterSelection();
   void renderStatusBarOverlay(GfxRenderer& renderer, StatusBarOverlayPosition position) const;
   StatusBarInfo getStatusBarInfo() const;
-  void saveProgress() const;
+  void saveProgress();
   void loadProgress();
 
   bool loadBook() override;

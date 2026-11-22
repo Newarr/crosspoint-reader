@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstring>
 
+#include "../../lib/Html5/Html5Markup.h"
 #include "CrossPointSettings.h"
 
 namespace {
@@ -67,15 +68,6 @@ class BufferedFileWriter {
   size_t used = 0;
 };
 
-// HTML void elements: legal without a closing tag in HTML, but must be
-// self-closed to be well-formed XML.
-bool isVoidElement(const char* name, const size_t len) {
-  static constexpr const char* VOID_ELEMENTS[] = {"area",  "base", "br",   "col",   "embed",  "hr",    "img",
-                                                  "input", "link", "meta", "param", "source", "track", "wbr"};
-  return std::any_of(std::begin(VOID_ELEMENTS), std::end(VOID_ELEMENTS),
-                     [name, len](const char* v) { return strlen(v) == len && strncmp(v, name, len) == 0; });
-}
-
 // True for a well-formed entity reference at html[pos] ('&'): &name; &#123;
 // or &#x1F;. On success *end is the index of the ';'.
 bool isEntityRef(const std::string& html, const size_t pos, size_t* end) {
@@ -113,11 +105,10 @@ bool writeNormalizedXhtml(const std::string& html, HalFile& file) {
   size_t i = 0;
   while (i < n) {
     const char c = html[i];
-    if (c == '<' && i + 1 < n && (html[i + 1] == '!' || html[i + 1] == '?')) {
-      // Comment, doctype or processing instruction: drop it entirely.
-      const bool isComment = html.compare(i, 4, "<!--") == 0;
-      const size_t j = isComment ? html.find("-->", i + 4) : html.find('>', i);
-      i = (j == std::string::npos) ? n : j + (isComment ? 3 : 1);
+    html5::OpaqueMarkup opaque;
+    if (c == '<' && i + 1 < n && opaque.start(html[i + 1])) {
+      i += 2;
+      while (i < n && opaque.active()) opaque.consume(html[i++]);
       continue;
     }
     if (c == '<' && i + 1 < n && (html[i + 1] == '/' || std::isalpha(static_cast<unsigned char>(html[i + 1])))) {
@@ -152,7 +143,7 @@ bool writeNormalizedXhtml(const std::string& html, HalFile& file) {
         }
         nameEnd++;
       }
-      const bool isVoid = isVoidElement(nameBuf, nameLen);
+      const bool isVoid = html5::isVoidElement({nameBuf, nameLen});
       if (closing && isVoid) {  // "</br>" — no XML equivalent, drop it
         i = j + 1;
         continue;

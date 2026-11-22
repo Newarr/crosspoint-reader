@@ -6,7 +6,6 @@
 #include <ComplexShaper.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
-#include <HalOtaSlot.h>
 #include <IndicReorder.h>
 #include <IndicScripts.h>
 #include <Logging.h>
@@ -216,9 +215,6 @@ void GfxRenderer::ensureSdCardFontReady(const int fontId, const char* const* seg
 }
 
 void GfxRenderer::begin() {
-#if defined(ESP_PLATFORM) && !defined(SIMULATOR)
-  otaConfirmationPending_ = HalOtaSlot::runningImageState() == HalOtaSlot::RunningImageState::PendingVerify;
-#endif
   frameBuffer = display.getFrameBuffer();
   if (!frameBuffer) {
     LOG_ERR("GFX", "!! No framebuffer");
@@ -1889,42 +1885,31 @@ void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   refreshMode = applyPromotedRefresh(refreshMode);
   display.displayBuffer(refreshMode, fadingFix);
-#if defined(ESP_PLATFORM) && !defined(SIMULATOR)
-  if (otaConfirmationPending_) {
-    otaConfirmationPending_ = false;
-    if (HalOtaSlot::confirmRunningImage()) {
-      for (const auto& entry : sdCardFonts_) {
-        if (entry.second) entry.second->preloadFlash();
-      }
-    } else {
-      LOG_ERR("OTA", "Failed to confirm running firmware");
-    }
+  ++blockingDisplayCount_;
+}
+
+void GfxRenderer::preloadFlashFonts() const {
+  for (const auto& entry : sdCardFonts_) {
+    if (entry.second) entry.second->preloadFlash();
   }
-#endif
 }
 
 bool GfxRenderer::canStageNextFrame() const {
-  return !fadingFix && !promotedRefreshPending_ && display.canStageNextFrame();
+  return !fadingFix && !promotedRefreshPending_ && !deferAsyncDisplay_ && display.canStageNextFrame();
 }
 
 bool GfxRenderer::stageNextFrame(bool (*shouldAbort)(void*), void* abortCtx) const {
   if (!canStageNextFrame()) return false;
-  return [&]<typename Display>(Display& target) {
-    if constexpr (requires { target.stageNextFrame(shouldAbort, abortCtx); }) {
-      return target.stageNextFrame(shouldAbort, abortCtx);
-    } else {
-      return (!shouldAbort || !shouldAbort(abortCtx)) && target.stageNextFrame();
-    }
-  }(display);
+  return display.stageNextFrame(shouldAbort, abortCtx);
 }
 
 bool GfxRenderer::triggerStagedFastRefresh() const {
-  if (fadingFix || promotedRefreshPending_ || otaConfirmationPending_) return false;
-  return display.triggerStagedFastRefresh(fadingFix);
+  if (fadingFix || promotedRefreshPending_ || deferAsyncDisplay_) return false;
+  return display.triggerStagedFastRefresh();
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
-  if (fadingFix || otaConfirmationPending_) {
+  if (fadingFix || deferAsyncDisplay_) {
     displayBuffer(refreshMode);
     return;
   }
@@ -1933,7 +1918,9 @@ void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const 
 
 void GfxRenderer::waitRefreshComplete() const { display.waitRefreshComplete(); }
 
-bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && display.supportsAsyncRefresh(); }
+bool GfxRenderer::supportsAsyncRefresh() const {
+  return !fadingFix && !deferAsyncDisplay_ && display.supportsAsyncRefresh();
+}
 
 HalDisplay::GrayscaleCapabilities GfxRenderer::grayscaleCapabilities(HalDisplay::GrayscaleMode mode) const {
   auto caps = display.grayscaleCapabilities(mode);
@@ -2277,7 +2264,7 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
 
 void GfxRenderer::setWidthCacheEnabled(const bool enabled) const {
   if (!enabled) {
-    widthCache_.reset();
+    releaseWordWidthCache();
   } else if (!widthCache_) {
     widthCache_ = makeUniqueNoThrow<WidthCache>();
   }
@@ -2286,11 +2273,14 @@ void GfxRenderer::setWidthCacheEnabled(const bool enabled) const {
 void GfxRenderer::clearWidthCache() const {
   if (!widthCache_) return;
   memset(widthCache_->keys, 0, sizeof(widthCache_->keys));
-  widthCache_->count = 0;
 }
+
+void GfxRenderer::releaseWordWidthCache() const { widthCache_.reset(); }
 
 int GfxRenderer::measureCachedWord(const int fontId, const char* text, const EpdFontFamily::Style style,
                                    const int8_t tracking) const {
+  if (!widthCache_) return measureVisualText(fontId, text, false, style, tracking, TextMeasureMode::Layout);
+
   constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
   constexpr uint64_t FNV_PRIME = 1099511628211ULL;
   constexpr size_t MAX_WORD_BYTES = 128;
@@ -2309,24 +2299,14 @@ int GfxRenderer::measureCachedWord(const int fontId, const char* text, const Epd
   }
   if (key == 0) key = 1;
 
-  constexpr size_t slotMask = WIDTH_CACHE_SLOTS - 1;
-  size_t slot = key & slotMask;
-  auto& cache = *widthCache_;
-  while (cache.keys[slot] != 0) {
-    if (cache.keys[slot] == key) return cache.widths[slot];
-    slot = (slot + 1) & slotMask;
-  }
+  const size_t slot = key % WIDTH_CACHE_SLOTS;
+  if (widthCache_->keys[slot] == key) return widthCache_->widths[slot];
 
   bool cacheable = true;
   const int width = measureVisualText(fontId, text, false, style, tracking, TextMeasureMode::Layout, &cacheable);
-  if (cacheable) {
-    if (cache.count >= WIDTH_CACHE_SLOTS * 3 / 4) {
-      clearWidthCache();
-      slot = key & slotMask;
-    }
-    cache.keys[slot] = key;
-    cache.widths[slot] = width;
-    ++cache.count;
+  if (cacheable && widthCache_) {
+    widthCache_->keys[slot] = key;
+    widthCache_->widths[slot] = width;
   }
   return width;
 }

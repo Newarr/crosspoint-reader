@@ -9,7 +9,6 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
-#include "ProgressFile.h"
 #include "ReaderActivity.h"
 #include "ReaderUtils.h"
 #include "XtcReaderChapterSelectionActivity.h"
@@ -329,28 +328,42 @@ void XtcReaderActivity::onReturnFromEndOfBook() {
   }
 }
 
-void XtcReaderActivity::saveProgress() const {
-  if (!xtc) return;
+void XtcReaderActivity::saveProgress() {
+  const uint32_t page = currentPage;
+  if (!canSaveProgress || page == savedPage) return;
   uint8_t data[4];
-  data[0] = currentPage & 0xFF;
-  data[1] = (currentPage >> 8) & 0xFF;
-  data[2] = (currentPage >> 16) & 0xFF;
-  data[3] = (currentPage >> 24) & 0xFF;
-  if (!ProgressFile::writeAtomic(xtc->getCachePath(), data, sizeof(data))) {
-    LOG_ERR("XTC", "Failed to save progress: page %lu", currentPage);
+  data[0] = page & 0xFF;
+  data[1] = (page >> 8) & 0xFF;
+  data[2] = (page >> 16) & 0xFF;
+  data[3] = (page >> 24) & 0xFF;
+  if (!ProgressFile::writeAtomic(xtc->getCachePath(), data, sizeof(data), &progressVersion)) {
+    LOG_ERR("XTC", "Failed to save progress: page %lu", page);
+    return;
   }
+  savedPage = page;
 }
 
 void XtcReaderActivity::loadProgress() {
   if (!xtc) return;
   uint8_t data[4];
-  if (ProgressFile::readAtomic(xtc->getCachePath(), data, sizeof(data)) == sizeof(data)) {
-    currentPage = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+  size_t size = 0;
+  auto status = ProgressFile::readAtomic(xtc->getCachePath(), data, sizeof(data), size, &progressVersion);
+  if (status == ProgressFile::ReadStatus::IoError) {
+    status = ProgressFile::readAtomic(xtc->getCachePath(), data, sizeof(data), size, &progressVersion);
+    if (status == ProgressFile::ReadStatus::IoError || status == ProgressFile::ReadStatus::Missing) {
+      LOG_ERR("XTR", "Could not read saved progress");
+      return;
+    }
+  }
+  canSaveProgress = true;
+  if (size == sizeof(data)) {
+    currentPage = uint32_t{data[0]} | (uint32_t{data[1]} << 8) | (uint32_t{data[2]} << 16) | (uint32_t{data[3]} << 24);
     if (currentPage >= xtc->getPageCount() && xtc->getPageCount() > 0) {
       currentPage = xtc->getPageCount() - 1;
     }
     LOG_DBG("XTC", "Loaded progress: page %lu/%lu", currentPage + 1, xtc->getPageCount());
   }
+  savedPage = currentPage;
 }
 
 ScreenshotInfo XtcReaderActivity::getScreenshotInfo() const {

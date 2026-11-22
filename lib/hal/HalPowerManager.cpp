@@ -68,10 +68,6 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // nothing, and then run at LOW_POWER_FREQ until the next key press.
   xSemaphoreTake(modeMutex, portMAX_DELAY);
   const LockMode mode = currentLockMode;
-  if (normalSpeedDwell) {
-    normalSpeedDwell = millis() - lastNormalSpeedPokeMs < NORMAL_POWER_DWELL_MS;
-    enabled = enabled && !normalSpeedDwell;
-  }
 
   if (mode == None && enabled && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");
@@ -96,28 +92,41 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   xSemaphoreGive(modeMutex);
 }
 
-void HalPowerManager::pokeNormalSpeed() {
-  if (gpio.deviceIsX3()) {
-    xSemaphoreTake(modeMutex, portMAX_DELAY);
-    lastNormalSpeedPokeMs = millis();
-    normalSpeedDwell = true;
-    xSemaphoreGive(modeMutex);
-  }
-  setPowerSaving(false);
-}
-
 #if FREEINK_MCU_C3
 namespace {
 
 constexpr uint8_t X3_I2C_BUS = 0;
+
+bool readX3BatteryPercentage(uint16_t& percent) {
+  constexpr uint32_t BATTERY_READ_TIMEOUT_MS = 10;
+  const uint8_t reg = BQ27220_SOC_REG;
+  uint8_t reply[2];
+  size_t received = 0;
+  // Wire releases its lock before callers consume its shared receive buffer.
+  if (!i2cIsInit(X3_I2C_BUS) ||
+      i2cWriteReadNonStop(X3_I2C_BUS, I2C_ADDR_BQ27220, &reg, sizeof(reg), reply, sizeof(reply),
+                          BATTERY_READ_TIMEOUT_MS, &received) != ESP_OK ||
+      received != sizeof(reply)) {
+    return false;
+  }
+  const uint16_t soc = reply[0] | (reply[1] << 8);
+  if (soc > 100) return false;
+  percent = soc;
+  return true;
+}
 
 struct LightSleepPin {
   gpio_num_t pin;
   gpio_int_type_t level;
 };
 
+struct LightSleepResult {
+  esp_err_t status = ESP_FAIL;
+  esp_sleep_wakeup_cause_t cause = ESP_SLEEP_WAKEUP_UNDEFINED;
+};
+
 template <size_t Count>
-esp_sleep_wakeup_cause_t lightSleep(const LightSleepPin (&pins)[Count], uint64_t timeoutUs) {
+LightSleepResult lightSleep(const LightSleepPin (&pins)[Count], uint64_t timeoutUs) {
   constexpr uint32_t WAKE_PAD_FLAGS = FUN_IE | SLP_SEL;
   constexpr UBaseType_t LIGHT_SLEEP_PRIORITY = 3;
   const UBaseType_t savedPriority = uxTaskPriorityGet(nullptr);
@@ -147,10 +156,11 @@ esp_sleep_wakeup_cause_t lightSleep(const LightSleepPin (&pins)[Count], uint64_t
     }
   }
 
-  esp_sleep_wakeup_cause_t cause = ESP_SLEEP_WAKEUP_UNDEFINED;
+  LightSleepResult result;
   if (ready && esp_sleep_enable_gpio_wakeup() == ESP_OK && esp_sleep_enable_timer_wakeup(timeoutUs) == ESP_OK &&
-      !(REG_READ(I2C_SR_REG(X3_I2C_BUS)) & I2C_BUS_BUSY) && esp_light_sleep_start() == ESP_OK) {
-    cause = esp_sleep_get_wakeup_cause();
+      !(REG_READ(I2C_SR_REG(X3_I2C_BUS)) & I2C_BUS_BUSY)) {
+    result.status = esp_light_sleep_start();
+    if (result.status == ESP_OK) result.cause = esp_sleep_get_wakeup_cause();
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
@@ -166,7 +176,7 @@ esp_sleep_wakeup_cause_t lightSleep(const LightSleepPin (&pins)[Count], uint64_t
     REG_WRITE(mux, (REG_READ(mux) & ~SLP_SEL) | savedKeepSlpSel[i]);
   }
   if (savedPriority < LIGHT_SLEEP_PRIORITY) vTaskPrioritySet(nullptr, savedPriority);
-  return cause;
+  return result;
 }
 
 }  // namespace
@@ -179,14 +189,14 @@ bool HalPowerManager::canLightSleep() const {
 bool HalPowerManager::lightSleepBetweenTurns() const {
   static constexpr LightSleepPin pins[] = {
       {GPIO_NUM_1, GPIO_INTR_LOW_LEVEL}, {GPIO_NUM_2, GPIO_INTR_LOW_LEVEL}, {GPIO_NUM_3, GPIO_INTR_LOW_LEVEL}};
-  return canLightSleep() && lightSleep(pins, 5000) != ESP_SLEEP_WAKEUP_UNDEFINED;
+  return canLightSleep() && lightSleep(pins, 5000).cause != ESP_SLEEP_WAKEUP_UNDEFINED;
 }
 
 bool HalPowerManager::lightSleepWhileDisplayBusy(int8_t busyPin, uint8_t busyLevel) const {
   if (busyPin != EPD_BUSY || !canLightSleep()) return false;
   const LightSleepPin pins[] = {
       {static_cast<gpio_num_t>(busyPin), busyLevel ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL}};
-  return lightSleep(pins, 5000) != ESP_SLEEP_WAKEUP_UNDEFINED;
+  return lightSleep(pins, 5000).cause != ESP_SLEEP_WAKEUP_UNDEFINED;
 }
 
 bool HalPowerManager::lightSleepStandby() const {
@@ -207,43 +217,37 @@ bool HalPowerManager::lightSleepStandby() const {
     delay(5);
   }
 
-  static const BatteryMonitor battery;
-  bool lastExternalPower = false;
-  {
-    bool known = false;
-    const bool ext = battery.isExternalPowerPresent(&known);
-    lastExternalPower = known ? ext : battery.isCharging();
-  }
+  const auto powerPressDebounced = [] {
+    for (uint32_t stableMs = 0; stableMs < PRESS_STABLE_MS; stableMs += 5) {
+      if (!gpio.isPowerButtonPhysicallyPressed()) return false;
+      delay(5);
+    }
+    return gpio.isPowerButtonPhysicallyPressed();
+  };
+  bool lastExternalPower = gpio.sampleUsbConnected();
 
   const int64_t deadlineUs = esp_timer_get_time() + STANDBY_US;
   while (canLightSleep()) {
     const int64_t remainingUs = deadlineUs - esp_timer_get_time();
     if (remainingUs <= 0) return false;
     const uint64_t sliceUs = static_cast<uint64_t>(std::min(remainingUs, USB_POLL_SLICE_US));
-    const auto cause = lightSleep(pins, sliceUs);
-    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) return false;
-    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-      uint32_t lowMs = 0;
-      while (lowMs < PRESS_STABLE_MS && gpio.isPowerButtonPhysicallyPressed()) {
-        delay(5);
-        lowMs += 5;
-      }
-      if (lowMs >= PRESS_STABLE_MS) return true;
+    const auto result = lightSleep(pins, sliceUs);
+    if (result.status == ESP_ERR_SLEEP_REJECT || result.cause == ESP_SLEEP_WAKEUP_GPIO) {
+      if (powerPressDebounced()) return true;
       continue;
     }
-    bool known = false;
-    const bool ext = battery.isExternalPowerPresent(&known);
-    const bool externalPower = known ? ext : battery.isCharging();
+    if (result.cause == ESP_SLEEP_WAKEUP_UNDEFINED) return false;
+    const bool externalPower = gpio.sampleUsbConnected();
     if (externalPower && !lastExternalPower) {
       // Allow USB-Serial-JTAG to enumerate if a real host was plugged in; stay asleep on dumb chargers.
       for (uint32_t waited = 0; waited < USB_ENUM_WAIT_MS; waited += 10) {
-        if (gpio.isUsbSerialActive() || gpio.isPowerButtonPhysicallyPressed()) return true;
+        if (gpio.isUsbSerialActive() || powerPressDebounced()) return true;
         delay(10);
       }
     }
     lastExternalPower = externalPower;
   }
-  return gpio.isUsbSerialActive() || gpio.isPowerButtonPhysicallyPressed();
+  return gpio.isUsbSerialActive() || powerPressDebounced();
 }
 #endif
 
@@ -367,6 +371,9 @@ bool HalPowerManager::holdWhileUsbPowered(HalGPIO& gpio, void (*onStatus)(bool c
 #endif
 
 bool HalPowerManager::readBatteryPercentage(uint16_t& percent) const {
+#if FREEINK_MCU_C3
+  if (gpio.deviceIsX3()) return readX3BatteryPercentage(percent);
+#endif
   static const BatteryMonitor battery;
   return battery.readPercentageChecked(percent);
 }
@@ -441,20 +448,9 @@ void HalPowerManager::pollBatteryCache() {
 
 void HalPowerManager::updateBatteryCache() {
 #if FREEINK_MCU_C3
-  constexpr uint32_t BATTERY_READ_TIMEOUT_MS = 10;
   constexpr int HYSTERESIS_PERCENT = 2;
-  const uint8_t reg = BQ27220_SOC_REG;
-  uint8_t reply[2];
-  size_t received = 0;
-  // Wire releases its lock before callers consume its shared receive buffer.
-  if (!i2cIsInit(X3_I2C_BUS) ||
-      i2cWriteReadNonStop(X3_I2C_BUS, I2C_ADDR_BQ27220, &reg, sizeof(reg), reply, sizeof(reply),
-                          BATTERY_READ_TIMEOUT_MS, &received) != ESP_OK ||
-      received != sizeof(reply)) {
-    return;
-  }
-  const int percent = reply[0] | (reply[1] << 8);
-  if (percent > 100) return;
+  uint16_t percent = 0;
+  if (!readX3BatteryPercentage(percent)) return;
   const int cached = x3BatteryPercent.load(std::memory_order_relaxed);
   if (cached < 0 || std::abs(percent - cached) >= HYSTERESIS_PERCENT) {
     x3BatteryPercent.store(percent, std::memory_order_relaxed);

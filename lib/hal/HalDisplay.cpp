@@ -74,9 +74,7 @@ void HalDisplay::setBusyWaitSliceHook(bool (*sliceHook)(int8_t, uint8_t)) {
   einkDisplay.setBusyWaitSliceHook(sliceHook);
 }
 
-bool HalDisplay::triggerStagedFastRefresh(bool turnOffScreen) {
-  return einkDisplay.triggerStagedFastRefresh(turnOffScreen);
-}
+bool HalDisplay::triggerStagedFastRefresh() { return einkDisplay.triggerStagedFastRefresh(); }
 
 void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {

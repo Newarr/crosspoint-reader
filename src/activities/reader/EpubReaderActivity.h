@@ -27,6 +27,7 @@ class EpubReaderActivity final : public ReaderActivity {
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
+  std::optional<int> pendingTurnPage;
   std::optional<uint16_t> pendingPageJump;
   std::string pendingAnchor;
   int cachedSpineIndex = 0;
@@ -64,6 +65,8 @@ class EpubReaderActivity final : public ReaderActivity {
   int idlePrewarmOffset = 0;
   unsigned long lastRenderCompleteMs = 0;
   int lastRenderedSpine = -1;
+  int lastRenderedPage = -1;
+  void recordPageDisplayed();
   // Speculative next-page pre-render & controller DTM2 pre-load (0 ms render/SPI on forward turn).
   std::optional<uint64_t> preloadedFingerprint;
   bool stageAttempted = false;
@@ -100,7 +103,8 @@ class EpubReaderActivity final : public ReaderActivity {
   int deferredImageGrayLeft = 0;
   unsigned long deferredImageGrayReadyAtMs = 0;
   void clearDeferredImageGray();
-  bool deferredImageGrayTick();
+  void drawPagePopup(const char* message);
+  void deferredImageGrayTick();
   static constexpr int GRAYSCALE_STRIP_ROWS = 80;
   std::unique_ptr<uint8_t[]> grayscaleStripScratch;
   size_t grayscaleStripScratchBytes = 0;
@@ -110,9 +114,15 @@ class EpubReaderActivity final : public ReaderActivity {
   std::unique_ptr<Section> nextChapterSection;
   int nextChapterSpineIndex = -1;
   int nextChapterFailedSpine = -1;
-  uint32_t nextChapterSpecSig = 0;
+  ReaderRenderSpec prebuildSpec;
+  struct PrebuildSizeRejection {
+    int spineIndex;
+    ReaderRenderSpec spec;
+  };
+  std::optional<PrebuildSizeRejection> prebuildSizeRejection;
+  bool inNextChapterPrebuildWindow() const;
   void clearNextChapterPrebuild();
-  bool prebuildNextChapterTick();
+  void prebuildNextChapterTick();
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
   bool recentsEntryRemoved = false;
@@ -182,9 +192,14 @@ class EpubReaderActivity final : public ReaderActivity {
   uint16_t buildViewportHeight = 0;
   bool deferPartialBuildUntilNeeded = false;
   bool embeddedStyleDisabledForBook = false;
+  int styledCacheBackupSpine = -1;
   ReaderRenderSpec makeRenderSpec(uint16_t width, uint16_t height) const;
-  enum class SectionRenderResult { Ready, BuildFailed, RadioBusy };
+  enum class SectionRenderResult { Ready, BuildFailed, RadioBusy, StorageError };
   SectionRenderResult prepareSectionForRender(const ReaderRenderSpec& spec);
+  SectionRenderResult prepareSectionWithStyleFallback(ReaderRenderSpec& spec);
+  bool resolvePendingTurnPage();
+  bool restoreStyledCache(int spineIndex) const;
+  void finishStyledCacheRetry(bool succeeded);
 
   int lastSavedSpineIndex = -1;
   int lastSavedPage = -1;
@@ -227,9 +242,10 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
   bool buildPopupPending = false;
-  void showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh);
+  void showBuildPopup();
   bool applyDeferredReposition();
   void clearDeferredReposition();
+  void resetNavigationTarget();
   void rememberCurrentContentOffset();
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   void jumpToPercent(int percent);
@@ -283,7 +299,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
-  bool renderContents(const Page& page, int orientedMarginTop, int orientedMarginLeft, bool skimPage);
+  enum class PageRenderResult { Cancelled, Displayed, DeferredImageGray };
+  PageRenderResult renderContents(const Page& page, int orientedMarginTop, int orientedMarginLeft, bool skimPage);
   void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
@@ -323,7 +340,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void loop() override;
   void onExit() override;
   void prepareForSleep() override;
-  void ensureFreshFrameBuffer() override;
+  void onStandbyResume(bool fastWake = false) override;
+  bool ensureFreshFrameBuffer() override;
   void render(RenderLock&& lock) override;
 
   bool pageTurn(bool isForward) override;

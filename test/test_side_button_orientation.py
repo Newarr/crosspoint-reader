@@ -18,7 +18,10 @@ panel = (ROOT / "src/activities/util/FrontlightPanelActivity.cpp").read_text()
 preview_setup = panel[panel.index("    static constexpr fui::Rotation rotations[]"):panel.index("    const fui::Rect row = screen.takeTop(kQuickControlSize)")]
 preview_draw = panel[panel.index("      screen.target().bitmap(iconRect"):panel.index("      // A tile whose function")]
 reader = (ROOT / "src/activities/reader/ReaderUtils.h").read_text()
-detect_turn = reader[reader.index("struct FrontPageTurnButtons"):reader.index("struct TouchPageTurn")]
+detect_turn = (
+    reader[reader.index("struct FrontPageTurnButtons"):reader.index("inline TouchPageTurn detectTouchPageTurn")]
+    + reader[reader.index("struct PageTurnResult"):reader.index("// Tap in the center third")]
+)
 
 stub = r"""
 #pragma once
@@ -30,9 +33,14 @@ struct HalGPIO {
   bool hasTouch() const { return touch; }
   bool wasPressed(uint8_t b) const { return pressed == b; }
   bool wasReleased(uint8_t b) const { return pressed == b; }
+  uint8_t wasPressedCount(uint8_t b) const { return pressed == b ? 1 : 0; }
+  uint8_t wasReleasedCount(uint8_t b) const { return pressed == b ? 1 : 0; }
+  bool wasAnyReleased() const { return pressed >= 0; }
+  bool rawInputActive() const { return false; }
   bool isPressed(uint8_t b) const { return pressed == b; }
   bool isPowerButtonPhysicallyPressed() const { return isPressed(BTN_POWER); }
 };
+extern HalGPIO gpio;
 """
 harness = r"""
 #include <cassert>
@@ -76,8 +84,12 @@ bool migrate(bool missing, uint8_t savedSide) {
   return needsResave;
 }
 """ + mapping + r"""
+HalGPIO gpio;
 bool MappedInputManager::wasPressed(Button b) const { return mapButton(b, &HalGPIO::wasPressed); }
 bool MappedInputManager::wasReleased(Button b) const { return mapButton(b, &HalGPIO::wasReleased); }
+uint8_t MappedInputManager::wasPressedCount(Button b) const { return wasPressed(b) ? 1 : 0; }
+uint8_t MappedInputManager::wasReleasedCount(Button b) const { return wasReleased(b) ? 1 : 0; }
+unsigned long MappedInputManager::getHeldTime() const { return 0; }
 bool MappedInputManager::wasLongPressed(Button, unsigned long) const { return false; }
 struct {
   bool wasTiltedForward() const { return false; }
@@ -174,9 +186,9 @@ int main() {
                 case CrossPointSettings::PREV_PREV: prev = up || down; break;
                 default: break;
               }
-              const auto turn = detectPageTurn(input);
-              assert(turn.prev == (prev || physical == (swapNav ? HalGPIO::BTN_RIGHT : HalGPIO::BTN_LEFT)));
-              assert(turn.next == (next || physical == (swapNav ? HalGPIO::BTN_LEFT : HalGPIO::BTN_RIGHT)));
+              const auto turn = detectPageTurn(input, {false, false, 0});
+              assert((turn.backCount > 0) == (prev || physical == (swapNav ? HalGPIO::BTN_RIGHT : HalGPIO::BTN_LEFT)));
+              assert((turn.forwardCount > 0) == (next || physical == (swapNav ? HalGPIO::BTN_LEFT : HalGPIO::BTN_RIGHT)));
               for (auto query : {&HalGPIO::wasPressed, &HalGPIO::wasReleased, &HalGPIO::isPressed}) {
                 assert(input.mapButton(Button::PageBack, query) == prev);
                 assert(input.mapButton(Button::PageForward, query) == next);

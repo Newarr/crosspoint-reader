@@ -111,11 +111,6 @@ ReadHandle prepare(const char* path, const size_t fileSize) {
   return {generation, fileSize};
 }
 
-bool isCurrent(const ReadHandle handle) {
-  std::lock_guard lock(cacheMutex);
-  return handle.generation != 0 && handle.generation == generation;
-}
-
 bool readAt(const ReadHandle handle, const size_t offset, void* data, const size_t length) {
   std::lock_guard lock(cacheMutex);
   if (handle.generation == 0 || handle.generation != generation || !containsPayloadRange(handle.size, offset, length)) {

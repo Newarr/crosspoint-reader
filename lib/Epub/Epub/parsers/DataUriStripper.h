@@ -1,18 +1,174 @@
 #pragma once
 
+#include <HalStorage.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string_view>
+
+#include "../../../Html5/Html5Markup.h"
+
+class ImageDataUriFilter {
+ public:
+  bool keep(char c) {
+    if (opaque.active()) {
+      opaque.consume(c);
+      return true;
+    }
+    switch (state) {
+      case State::Text:
+        if (c == '<') state = State::TagOpen;
+        break;
+      case State::TagOpen:
+        if (opaque.start(c) || c == '>') {
+          state = State::Text;
+        } else if (c == '/') {
+          state = State::ClosingTag;
+        } else {
+          nameLength = 0;
+          appendName(c);
+          state = State::TagName;
+        }
+        break;
+      case State::TagName:
+        if (c == '>') {
+          state = State::Text;
+        } else if (isSpace(c) || c == '/') {
+          const auto tag = currentName();
+          imageTag = tag == "img" || tag == "image";
+          state = State::BetweenAttributes;
+        } else if (c == ':') {
+          nameLength = 0;
+        } else {
+          appendName(c);
+        }
+        break;
+      case State::ClosingTag:
+        if (c == '>') state = State::Text;
+        break;
+      case State::BetweenAttributes:
+      case State::AfterAttributeName:
+        if (c == '>') {
+          state = State::Text;
+        } else if (c == '=' && state == State::AfterAttributeName) {
+          beginValue();
+        } else if (!isSpace(c) && c != '/') {
+          beginAttribute(c);
+        }
+        break;
+      case State::AttributeName:
+        if (c == '=') {
+          beginValue();
+        } else if (c == '>') {
+          state = State::Text;
+        } else if (isSpace(c)) {
+          state = State::AfterAttributeName;
+        } else {
+          appendName(c);
+        }
+        break;
+      case State::BeforeValue:
+        if (c == '"' || c == '\'') {
+          quote = c;
+          state = State::QuotedValue;
+        } else if (c == '>') {
+          state = State::Text;
+        } else if (!isSpace(c)) {
+          state = State::UnquotedValue;
+          return keepValue(c);
+        }
+        break;
+      case State::UnquotedValue:
+        if (c == '>') {
+          state = State::Text;
+        } else if (isSpace(c)) {
+          state = State::BetweenAttributes;
+        } else {
+          return keepValue(c);
+        }
+        break;
+      case State::QuotedValue:
+        if (c == quote) {
+          state = State::BetweenAttributes;
+        } else {
+          return keepValue(c);
+        }
+        break;
+    }
+    return true;
+  }
+
+ private:
+  enum class State : uint8_t {
+    Text,
+    TagOpen,
+    TagName,
+    ClosingTag,
+    BetweenAttributes,
+    AttributeName,
+    AfterAttributeName,
+    BeforeValue,
+    UnquotedValue,
+    QuotedValue
+  };
+  State state = State::Text;
+  html5::OpaqueMarkup opaque;
+  char name[10] = {};
+  uint8_t nameLength = 0;
+  char quote = 0;
+  bool imageTag = false;
+  bool sourceAttribute = false;
+  uint8_t dataPrefixLength = 0;
+
+  static bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+  void appendName(char c) {
+    if (nameLength < sizeof(name))
+      name[nameLength++] = html5::lowerAscii(c);
+    else
+      nameLength = sizeof(name) + 1;
+  }
+
+  std::string_view currentName() const {
+    return nameLength <= sizeof(name) ? std::string_view(name, nameLength) : std::string_view{};
+  }
+
+  void beginAttribute(char c) {
+    nameLength = 0;
+    appendName(c);
+    state = State::AttributeName;
+  }
+
+  void beginValue() {
+    const auto attribute = currentName();
+    sourceAttribute = imageTag && (attribute == "src" || attribute == "href" || attribute == "xlink:href");
+    dataPrefixLength = 0;
+    state = State::BeforeValue;
+  }
+
+  bool keepValue(char c) {
+    if (!sourceAttribute) return true;
+    if (dataPrefixLength == 5) return false;
+    if (html5::lowerAscii(c) == "data:"[dataPrefixLength])
+      ++dataPrefixLength;
+    else
+      sourceAttribute = false;
+    return true;
+  }
+};
 
 class DataUriStripper {
  public:
   static constexpr size_t BUFFER_SIZE = 1024;
 
   size_t strip(char* buffer, size_t length) {
+    previousChunk = currentChunk;
+    currentChunk = {filter, xmlEnd, xmlEnd + removedBytes};
     size_t written = 0;
     for (size_t i = 0; i < length; ++i) {
       const char c = buffer[i];
-      if (keep(c)) {
+      if (filter.keep(c)) {
         buffer[written++] = c;
       } else {
         recordRemoval(xmlEnd + written);
@@ -22,16 +178,42 @@ class DataUriStripper {
     return written;
   }
 
-  std::optional<size_t> rawOffset(size_t xmlOffset) const {
+  std::optional<size_t> rawOffset(size_t xmlOffset, HalFile& file) const {
     if (removedBytes == 0 || xmlOffset < firstRemoval) return xmlOffset;
     for (size_t i = 0; i < removalCount; ++i) {
       const auto& removal = removals[(nextRemoval + MAX_REMOVALS - 1 - i) % MAX_REMOVALS];
       if (removal.xml <= xmlOffset) return xmlOffset + removal.bytes;
     }
-    return std::nullopt;
+
+    ChunkStart start;
+    if (xmlOffset >= currentChunk.xml) {
+      start = currentChunk;
+    } else if (xmlOffset >= previousChunk.xml) {
+      start = previousChunk;
+    }
+    if (!file.seek(start.raw)) return std::nullopt;
+    char buffer[128];
+    size_t raw = start.raw;
+    size_t xml = start.xml;
+    for (;;) {
+      const int length = file.read(buffer, sizeof(buffer));
+      if (length <= 0) return std::nullopt;
+      for (int i = 0; i < length; ++i, ++raw) {
+        if (start.filter.keep(buffer[i]) && xml++ == xmlOffset) return raw;
+      }
+    }
   }
 
  private:
+  struct ChunkStart {
+    ImageDataUriFilter filter;
+    size_t xml = 0;
+    size_t raw = 0;
+  };
+  ImageDataUriFilter filter;
+  ChunkStart currentChunk;
+  ChunkStart previousChunk;
+
   struct OffsetAdjustment {
     size_t xml;
     size_t bytes;
@@ -57,134 +239,5 @@ class DataUriStripper {
     removals[nextRemoval] = {xmlOffset, removedBytes};
     nextRemoval = (nextRemoval + 1) % MAX_REMOVALS;
     if (removalCount < MAX_REMOVALS) ++removalCount;
-  }
-
-  enum class State : uint8_t { Text, TagOpen, TagName, Attribute, Quote, Declaration, Comment, Cdata, Instruction };
-  State state = State::Text;
-  char quote = 0;
-  uint8_t attributeLength = 0;
-  bool sourceAttribute = false;
-  bool afterEquals = false;
-  bool afterAttributeName = false;
-  uint8_t dataPrefixLength = 0;
-  char previous = 0;
-  char beforePrevious = 0;
-  uint8_t declarationPrefixLength = 0;
-  bool commentPrefix = false;
-  bool cdataPrefix = false;
-  bool inSubset = false;
-
-  static bool isSpace(const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
-  static char lower(const char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; }
-
-  void resetAttribute() {
-    attributeLength = 0;
-    sourceAttribute = false;
-    afterEquals = false;
-    afterAttributeName = false;
-  }
-
-  bool keep(const char c) {
-    switch (state) {
-      case State::Text:
-        if (c == '<') state = State::TagOpen;
-        break;
-      case State::TagOpen:
-        if (c == '!') {
-          state = State::Declaration;
-          declarationPrefixLength = 0;
-          commentPrefix = cdataPrefix = true;
-          inSubset = false;
-        } else if (c == '?') {
-          state = State::Instruction;
-          previous = 0;
-        } else {
-          state = c == '>' ? State::Text : State::TagName;
-        }
-        break;
-      case State::TagName:
-        if (c == '>') {
-          state = State::Text;
-        } else if (isSpace(c)) {
-          state = State::Attribute;
-          resetAttribute();
-        }
-        break;
-      case State::Attribute:
-        if (c == '>') {
-          state = State::Text;
-        } else if (c == '"' || c == '\'') {
-          state = State::Quote;
-          quote = c;
-          dataPrefixLength = sourceAttribute && afterEquals ? 0 : 6;
-        } else if (c == '=') {
-          sourceAttribute = sourceAttribute && attributeLength == 3;
-          afterEquals = true;
-          attributeLength = 0;
-        } else if (isSpace(c)) {
-          afterAttributeName = !afterEquals;
-        } else {
-          if (attributeLength == 0 || afterAttributeName) {
-            sourceAttribute = !afterEquals;
-            attributeLength = 0;
-            afterEquals = false;
-            afterAttributeName = false;
-          }
-          if (attributeLength < 3) {
-            sourceAttribute = sourceAttribute && lower(c) == "src"[attributeLength];
-            ++attributeLength;
-          } else {
-            sourceAttribute = false;
-          }
-        }
-        break;
-      case State::Quote:
-        if (c == quote) {
-          quote = 0;
-          state = State::Attribute;
-          resetAttribute();
-        } else if (dataPrefixLength == 5) {
-          return false;
-        } else if (dataPrefixLength < 5) {
-          dataPrefixLength = lower(c) == "data:"[dataPrefixLength] ? dataPrefixLength + 1 : 6;
-        }
-        break;
-      case State::Declaration:
-        if (commentPrefix || cdataPrefix) {
-          commentPrefix = commentPrefix && c == "--"[declarationPrefixLength];
-          cdataPrefix = cdataPrefix && c == "[CDATA["[declarationPrefixLength];
-          ++declarationPrefixLength;
-          if (commentPrefix && declarationPrefixLength == 2) {
-            state = State::Comment;
-            previous = beforePrevious = 0;
-          } else if (cdataPrefix && declarationPrefixLength == 7) {
-            state = State::Cdata;
-            previous = beforePrevious = 0;
-          }
-          if (commentPrefix || cdataPrefix) break;
-        }
-        if (quote) {
-          if (c == quote) quote = 0;
-        } else if (c == '\'' || c == '"') {
-          quote = c;
-        } else if (c == '[' || c == ']') {
-          inSubset = c == '[';
-        } else if (c == '>' && !inSubset) {
-          state = State::Text;
-        }
-        break;
-      case State::Comment:
-      case State::Cdata:
-      case State::Instruction: {
-        const char delimiter = state == State::Comment ? '-' : state == State::Cdata ? ']' : '?';
-        if (c == '>' && previous == delimiter && (state == State::Instruction || beforePrevious == delimiter)) {
-          state = State::Text;
-        }
-        beforePrevious = previous;
-        previous = c;
-        break;
-      }
-    }
-    return true;
   }
 };

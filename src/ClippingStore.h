@@ -105,11 +105,7 @@ class ClippingStore {
 
 inline bool clippingStoredRangeMatchesLayout(const Clipping& clipping, const uint16_t currentPageCount,
                                              const uint32_t currentLayoutSignature) {
-  if (clipping.pageCount != currentPageCount) return false;
-  // A zero signature belongs to legacy data and cannot safely address page-local
-  // word ordinals after relayout. It remains viewable in the clipping list, but
-  // is not rendered as a highlight until it can be anchored by a newer format.
-  return clipping.layoutSignature != 0 && currentLayoutSignature != 0 &&
+  return clipping.pageCount == currentPageCount && clipping.layoutSignature != 0 &&
          clipping.layoutSignature == currentLayoutSignature;
 }
 

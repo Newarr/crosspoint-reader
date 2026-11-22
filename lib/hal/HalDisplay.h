@@ -64,7 +64,7 @@ class HalDisplay {
   bool stageNextFrame(bool (*shouldAbort)(void*) = nullptr, void* abortCtx = nullptr);
   void requestResync();
   void setBusyWaitSliceHook(bool (*sliceHook)(int8_t busyPin, uint8_t busyLevel));
-  bool triggerStagedFastRefresh(bool turnOffScreen = false);
+  bool triggerStagedFastRefresh();
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
   // until waitRefreshComplete(), and the caller must rebuild the differential

@@ -16,7 +16,6 @@ class ImageBlock final : public Block {
 
   bool hasValidCache() const;
   bool needsDecode() const;
-  static void setBilinearScaling(bool enabled);
   bool needsFramebufferLoanToDecode() const;
   bool cacheImage(GfxRenderer& renderer, int x, int y);
   void renderPlaceholder(GfxRenderer& renderer, int x, int y) const;

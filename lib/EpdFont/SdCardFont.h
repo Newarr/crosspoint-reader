@@ -45,9 +45,8 @@ class SdCardFont {
   // Load .cpfont file: reads header + intervals into RAM, records file layout offsets.
   // Supports v4 (multi-style) format.
   // Returns true on success.
-  bool load(const std::string& path, bool preferFlash = true);
+  bool load(const char* path, bool preferFlash = true);
   void closeFileHandle();
-  bool usingFlash() const;
   void preloadFlash();
 
   // Pre-read glyphs needed for the given UTF-8 text from SD card.
@@ -326,7 +325,9 @@ class SdCardFont {
   struct AdvanceEntry {
     uint32_t codepoint;
     uint16_t advanceX;  // 12.4 fixed-point
+    bool speculative;
   };
+  static_assert(sizeof(AdvanceEntry) == 8);
   // Per-style advance table. Sorted by codepoint for binary lookup.
   // Bounded to ADVANCE_CACHE_LIMIT entries; persists across layout passes
   // (across calls to clearCache()) so repeated indexing of the same font
@@ -334,14 +335,12 @@ class SdCardFont {
   static constexpr uint32_t ADVANCE_CACHE_LIMIT = 768;
   AdvanceEntry* advanceTable_[MAX_STYLES] = {};
   uint32_t advanceTableSize_[MAX_STYLES] = {};
+  uint16_t advanceTableSeedCount_[MAX_STYLES] = {};
   // Allocated entries. Merges fill spare capacity in place, and growth doubles it,
   // so a table moves a few times per section instead of on every layout pass.
   uint32_t advanceTableCapacity_[MAX_STYLES] = {};
-  bool advanceTableLookup(uint8_t styleIdx, uint32_t codepoint, uint16_t* outAdvance) const;
-  // Merge sortedNew (sorted by codepoint, no overlap with existing) into the
-  // advance table for styleIdx, preserving sort order; cap-truncates the tail.
-  // Grows the table only when the merge exceeds its capacity.
-  void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount);
+  uint32_t findAdvanceEntryIndex(uint8_t styleIdx, uint32_t codepoint) const;
+  void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount, bool speculative);
   // Ensures room for `needed` entries, at least doubling the capacity when it grows.
   bool growAdvanceTable(uint8_t styleIdx, uint32_t needed);
 
@@ -383,7 +382,7 @@ class SdCardFont {
   // False for a glyph entry the file cannot back (a corrupt .cpfont): its data length must be the
   // packed size of its pixels and its bitmap must lie inside the file. Logs the first few per font.
   bool glyphEntryValid(const PerStyle& s, const EpdGlyph& glyph, uint32_t codepoint);
-  int fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCount, uint8_t styleMask);
+  int fetchAdvancesForCodepoints(const uint32_t* codepoints, uint32_t cpCount, uint8_t styleIdx, bool speculative);
   int prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly, bool loadKernLig,
                    bool accumulate);
 

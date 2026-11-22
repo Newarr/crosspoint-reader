@@ -317,13 +317,16 @@ void CrossPointWebServerActivity::startWebServer() {
   // An upload holds loop() inside handleClient(), so input is sampled on each received chunk instead. On a slow
   // link chunks come ~0.5 s apart, so a button found down gets a second sample past the SDK's 5 ms debounce.
   webServer->setUploadCancelCheck([this] {
-    mappedInput.update(true);
-    if (gpio.rawInputActive()) {
-      delay(6);
+    const auto sampledCancellation = [this] {
       mappedInput.update(true);
+      return mappedInput.isPressed(MappedInputManager::Button::Back) ||
+             mappedInput.wasPressed(MappedInputManager::Button::Back) || mappedInput.wasHomeGesture();
+    };
+    leaveRequested = leaveRequested || sampledCancellation();
+    if (!leaveRequested && gpio.rawInputActive()) {
+      delay(6);
+      leaveRequested = sampledCancellation();
     }
-    leaveRequested = leaveRequested || mappedInput.isPressed(MappedInputManager::Button::Back) ||
-                     mappedInput.wasPressed(MappedInputManager::Button::Back) || mappedInput.wasHomeGesture();
     return leaveRequested;
   });
   webServer->begin();

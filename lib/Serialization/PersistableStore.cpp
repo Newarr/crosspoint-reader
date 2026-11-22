@@ -10,6 +10,7 @@
 
 namespace {
 
+constexpr size_t MAX_JSON_BYTES = 50000;
 std::mutex jsonFileMutex;
 
 class JsonFileWriter {
@@ -52,7 +53,7 @@ class JsonFileReader {
   bool failed = false;
 
  public:
-  explicit JsonFileReader(HalFile& file) : file(file), length(file.size()) {}
+  JsonFileReader(HalFile& file, size_t length) : file(file), length(length) {}
 
   int read() {
     if (position == available) {
@@ -94,7 +95,12 @@ enum class JsonReadResult { Valid, Invalid, Unreadable };
 JsonReadResult readJsonFile(const char* path, JsonDocument& doc) {
   HalFile file;
   if (!Storage.openFileForRead("PERSIST", path, file)) return JsonReadResult::Unreadable;
-  JsonFileReader reader(file);
+  const uint64_t length = file.fileSize64();
+  if (length > MAX_JSON_BYTES) {
+    LOG_ERR("PERSIST", "JSON file exceeds %zu bytes: %s", MAX_JSON_BYTES, path);
+    return JsonReadResult::Invalid;
+  }
+  JsonFileReader reader(file, static_cast<size_t>(length));
   const auto error = deserializeJson(doc, reader);
   if (!error && reader.atEndOfDocument()) return JsonReadResult::Valid;
   LOG_ERR("PERSIST", "JSON read failed for %s: %s", path, error ? error.c_str() : "trailing data");
@@ -111,25 +117,49 @@ bool PersistableStoreBase::writeDocToFile(const char* path, const JsonDocument& 
     return false;
   }
 
+  const size_t expected = measureJson(doc);
+  if (expected > MAX_JSON_BYTES) {
+    LOG_ERR("PERSIST", "JSON data exceeds %zu bytes: %s", MAX_JSON_BYTES, path);
+    return false;
+  }
+
   Storage.mkdir("/.crosspoint");
   const std::string temporary = std::string(path) + ".tmp";
-  if (!Storage.exists(path) && Storage.exists(temporary.c_str())) {
-    JsonDocument pending;
-    const auto result = readJsonFile(temporary.c_str(), pending);
-    if (result == JsonReadResult::Unreadable ||
-        (result == JsonReadResult::Valid && !Storage.rename(temporary.c_str(), path))) {
+  if (Storage.exists(temporary.c_str())) {
+    JsonDocument existing;
+    const auto canonical = Storage.exists(path) ? readJsonFile(path, existing) : JsonReadResult::Invalid;
+    bool tempCleared = false;
+    if (canonical == JsonReadResult::Valid) {
+      tempCleared = Storage.remove(temporary.c_str());
+    } else if (canonical == JsonReadResult::Invalid) {
+      existing.clear();
+      switch (readJsonFile(temporary.c_str(), existing)) {
+        case JsonReadResult::Valid:
+          tempCleared = Storage.replaceFile(temporary.c_str(), path);
+          break;
+        case JsonReadResult::Invalid:
+          tempCleared = Storage.remove(temporary.c_str());
+          break;
+        case JsonReadResult::Unreadable:
+          break;
+      }
+    }
+    if (!tempCleared) {
       LOG_ERR("PERSIST", "Could not preserve pending file for %s", path);
       return false;
     }
   }
 
-  HalFile file;
-  if (!Storage.openFileForWrite("PERSIST", temporary, file)) return false;
+  HalFile file = Storage.open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL);
+  if (!file) {
+    LOG_ERR("PERSIST", "Could not create temporary file for %s", path);
+    return false;
+  }
   JsonFileWriter writer(file);
   const size_t written = serializeJson(doc, writer);
   const bool flushed = writer.flush();
   const bool closed = file.close();
-  if (!flushed || !closed || written != measureJson(doc)) {
+  if (!flushed || !closed || written != expected) {
     Storage.remove(temporary.c_str());
     LOG_ERR("PERSIST", "Incomplete JSON write for %s", path);
     return false;

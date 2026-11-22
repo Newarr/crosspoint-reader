@@ -9,15 +9,17 @@
 class HalFile {
  public:
   explicit operator bool() const { return open_; }
-  void close() {
+  bool close() {
     EXPECT_TRUE(initialized_) << "Closing a default HalFile asserts on device";
     open_ = false;
+    return true;
   }
   bool seek(size_t position) {
     position_ = position;
     return true;
   }
   size_t position() const { return position_; }
+  size_t size() const { return position_; }
   int available() const { return 0; }
   void markOpen() {
     initialized_ = true;

@@ -18,10 +18,10 @@ class BmpStreamWriter {
   BmpStreamWriter(const BmpStreamWriter&) = delete;
   BmpStreamWriter& operator=(const BmpStreamWriter&) = delete;
 
-  using QuantizePixel = uint8_t (*)(int x, int y, uint8_t gray);
+  enum class Dithering { Atkinson, BlueNoise };
 
   bool begin(Print& output, int width, int height, bool oneBit, bool originalThresholds = false,
-             QuantizePixel quantizePixel = nullptr);
+             Dithering defaultDithering = Dithering::Atkinson);
   bool writeRow(const uint8_t* grayRow, int y);
 
   int getWidth() const { return width; }
@@ -34,7 +34,7 @@ class BmpStreamWriter {
   int height{0};
   int bytesPerRow{0};
   bool oneBit{false};
-  QuantizePixel quantizePixel{nullptr};
+  Dithering dithering{Dithering::Atkinson};
   uint8_t rowsSinceYield{0};
   std::unique_ptr<uint8_t[]> packedRow;
   std::unique_ptr<uint8_t[]> scratchRow;

@@ -14,7 +14,7 @@
 #include "FsHelpers.h"
 
 namespace {
-constexpr uint8_t BOOK_CACHE_VERSION = 10;  // v10: ignore ambiguous guide text references
+constexpr uint8_t BOOK_CACHE_VERSION = 11;
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -86,8 +86,7 @@ bool BookMetadataCache::beginContentOpfPass() {
   if (!Storage.openFileForWrite("BMC", cachePath + tmpSpineBinFile, spineFile)) {
     return false;
   }
-  // Wrapper OOM is fine: createSpineEntry falls back to unbuffered writes.
-  passOut = makeUniqueNoThrow<serialization::BufferedFileWriter>(spineFile, BUILD_IO_BUFFER_SIZE);
+  passOut.emplace(spineFile, BUILD_IO_BUFFER_SIZE);
   return true;
 }
 
@@ -95,16 +94,15 @@ bool BookMetadataCache::endContentOpfPass() {
   const bool flushed = !passOut || passOut->flush();
   passOut.reset();
   // Explicit close() required: member variable persists beyond function scope
-  spineFile.close();
-  if (!flushed) {
+  const bool closed = spineFile.close();
+  if (!flushed || !closed) {
     LOG_ERR("BMC", "Failed writing spine tmp file");
+    return false;
   }
-  return flushed;
+  return true;
 }
 
 const char* BookMetadataCache::tocTempFile() const { return alternateToc ? tmpAlternateTocBinFile : tmpTocBinFile; }
-
-bool BookMetadataCache::beginTocPass() { return beginTocPass(false); }
 
 bool BookMetadataCache::beginTocPass(const bool alternate) {
   selectTocPass(alternate, 0);
@@ -135,25 +133,23 @@ bool BookMetadataCache::beginTocPass(const bool alternate) {
               });
   }
 
-  // Wrapper OOM is fine: createTocEntry falls back to unbuffered writes.
-  passOut = makeUniqueNoThrow<serialization::BufferedFileWriter>(tocFile, BUILD_IO_BUFFER_SIZE);
+  passOut.emplace(tocFile, BUILD_IO_BUFFER_SIZE);
   return true;
 }
 
 bool BookMetadataCache::endTocPass() {
   const bool flushed = !passOut || passOut->flush();
   passOut.reset();
-  if (!flushed) {
-    LOG_ERR("BMC", "Failed writing toc tmp file");
-  }
-  // Explicit close() required: member variables persist beyond function scope
-  tocFile.close();
+  const bool closed = tocFile.close();
   spineFile.close();
-
   spineHrefIndex.reset();
   tocSpinesSeen.reset();
 
-  return flushed;
+  if (!flushed || !closed) {
+    LOG_ERR("BMC", "Failed writing toc tmp file");
+    return false;
+  }
+  return true;
 }
 
 void BookMetadataCache::selectTocPass(const bool alternate, const uint16_t count) {
@@ -383,28 +379,16 @@ bool BookMetadataCache::cleanupTmpFiles() const {
   return true;
 }
 
-uint32_t BookMetadataCache::writeSpineEntry(HalFile& file, const SpineEntry& entry) const {
-  return writeSpineEntryTo(file, entry);
-}
-
-uint32_t BookMetadataCache::writeTocEntry(HalFile& file, const TocEntry& entry) const {
-  return writeTocEntryTo(file, entry);
-}
-
 // Note: for the LUT to be accurate, this **MUST** be called for all spine items before `addTocEntry` is ever called
 // this is because in this function we're marking positions of the items
 void BookMetadataCache::createSpineEntry(const std::string& href) {
-  if (!buildMode || !spineFile) {
+  if (!buildMode || !spineFile || !passOut) {
     LOG_DBG("BMC", "createSpineEntry called but not in build mode");
     return;
   }
 
   const SpineEntry entry(href, 0, -1);
-  if (passOut) {
-    writeSpineEntryTo(*passOut, entry);
-  } else {
-    writeSpineEntry(spineFile, entry);
-  }
+  writeSpineEntryTo(*passOut, entry);
   spineCount++;
 }
 
@@ -447,7 +431,7 @@ int16_t BookMetadataCache::findTocSpineIndex(const std::string& href) {
 
 void BookMetadataCache::createTocEntry(const std::string& title, const std::string& href, const std::string& anchor,
                                        const uint8_t level) {
-  if (!buildMode || !tocFile || !spineFile) {
+  if (!buildMode || !tocFile || !spineFile || !passOut) {
     LOG_DBG("BMC", "createTocEntry called but not in build mode");
     return;
   }
@@ -465,11 +449,7 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
   // Compose the title to NFC at index time so the cache stores precomposed glyphs;
   // device fonts have no combining-mark positioning, so NFD titles render broken.
   const TocEntry entry(utf8ComposeNfc(title), href, anchor, level, spineIndex);
-  if (passOut) {
-    writeTocEntryTo(*passOut, entry);
-  } else {
-    writeTocEntry(tocFile, entry);
-  }
+  writeTocEntryTo(*passOut, entry);
   tocCount++;
 }
 

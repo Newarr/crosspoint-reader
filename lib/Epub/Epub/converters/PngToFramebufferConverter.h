@@ -12,7 +12,4 @@ class PngToFramebufferConverter final : public ImageToFramebufferDecoder {
   bool getDimensions(const std::string& imagePath, ImageDimensions& dims) const override {
     return getDimensionsStatic(imagePath, dims);
   }
-
-  static bool supportsFormat(const std::string& extension);
-  const char* getFormatName() const override { return "PNG"; }
 };

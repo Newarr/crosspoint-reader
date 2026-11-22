@@ -2,6 +2,8 @@
 
 #include <HalGPIO.h>
 
+#include <array>
+
 #include "util/HomeButtonInput.h"
 #include "util/PowerButtonClickInput.h"
 #include "util/PowerButtonInput.h"
@@ -65,17 +67,16 @@ class MappedInputManager {
     return gpio.isPressed(HalGPIO::BTN_POWER) || gpio.isPowerButtonPhysicallyPressed();
 #endif
   }
-  void beginPowerInput(bool suppressHold, bool held) {
-    powerButtonInput.begin(suppressHold, held);
-    resetPowerButtonInput();
+  void beginPowerInput(bool suppressHold, bool held);
+  bool wasShortPowerReleased() const { return shortPowerReleaseFrame; }
+  bool powerSleepRequested() const { return powerHoldSleepFrame; }
+  bool wasPowerReleaseConsumed() const {
+    return consumedPowerReleases > 0 || consumedSharedConfirmClick || powerButtonInput.wasReleaseConsumed();
   }
-  bool wasShortPowerReleased() const {
-    return gpio.wasReleased(HalGPIO::BTN_POWER) && powerButtonInput.wasShortReleased();
-  }
-  bool powerSleepRequested() const { return powerButtonInput.shouldSleep(); }
-  bool wasPowerReleaseConsumed() const { return powerButtonInput.wasReleaseConsumed(); }
   void consumePowerGesture() const {
     powerButtonInput.consume();
+    shortPowerReleaseFrame = false;
+    powerHoldSleepFrame = false;
     resetPowerButtonInput();
   }
   bool suppressPowerAfterRestart() const { return isPowerHeld() && powerButtonInput.suppressesHold(); }
@@ -87,7 +88,6 @@ class MappedInputManager {
   uint8_t wasReleasedCount(Button button) const;
   // One-shot threshold event while the button is down; consumes its release.
   bool wasLongPressed(Button button, unsigned long thresholdMs) const;
-  bool consumeSuppressedRelease() const;
   bool isPressed(Button button) const;
   bool hasTouch() const;
   bool wasScreenTapped(int& x, int& y) const;
@@ -169,7 +169,12 @@ class MappedInputManager {
   Labels mapFrontLabels(const char* back, const char* confirm, const char* left, const char* right) const;
   bool mapButton(Button button, bool (HalGPIO::*fn)(uint8_t) const) const;
   uint8_t physicalButtons(Button button) const;
-  uint8_t countButtonEdges(Button button, uint8_t (HalGPIO::*count)(uint8_t) const) const;
+  uint8_t countButtonEdges(Button button, bool released) const;
+  bool hasSyntheticClick(Button button) const;
+  bool classifiesPowerClicks() const;
+  void updatePowerInput(uint32_t now, bool classifyClicks) const;
+  void applyPowerClick(PowerButtonClickInput::Click click) const;
+  void updateButtonHolds(uint32_t now) const;
   // SDK edge classification (fui::edgeSwipe) + the shared decode/held-time
   // bookkeeping; the wrappers below give each edge its board meaning.
   bool wasEdgeSwipe(freeink::ui::ScreenEdge edge) const;
@@ -181,12 +186,17 @@ class MappedInputManager {
   bool wasPowerConfirmClick() const;
 #endif
   void rememberTouchHeldTime() const;
-  void suppressNextRelease(Button button) const;
 
   mutable RemoteButtonInput remoteInput;
   mutable HomeButtonInput homeButtonInput;
   mutable PowerButtonInput powerButtonInput;
   mutable PowerButtonClickInput powerButtonClickInput;
+  mutable uint32_t powerPressedAt = 0;
+  mutable bool powerPressTracked = false;
+  mutable uint8_t consumedPowerReleases = 0;
+  mutable bool consumedSharedConfirmClick = false;
+  mutable bool shortPowerReleaseFrame = false;
+  mutable bool powerHoldSleepFrame = false;
   mutable bool powerSingleClickFrame = false;
   mutable bool powerSleepFrame = false;
   mutable bool deferredPowerSleepFrame = false;
@@ -195,6 +205,9 @@ class MappedInputManager {
   mutable bool touchHeldOverrideValid = false;
   mutable unsigned long touchHeldOverrideMs = 0;
   mutable unsigned long touchHeldOverrideAt = 0;
-  mutable uint16_t longPressFiredButtons = 0;
-  mutable uint16_t suppressedReleaseButtons = 0;
+  mutable std::array<uint32_t, HalGPIO::BTN_POWER + 1> pressedAt{};
+  mutable uint8_t heldButtons = 0;
+  mutable uint8_t longPressFiredButtons = 0;
+  mutable uint8_t suppressedReleaseButtons = 0;
+  mutable uint8_t suppressedReleasesThisFrame = 0;
 };

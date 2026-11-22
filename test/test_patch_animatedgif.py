@@ -24,12 +24,30 @@ class PatchAnimatedGifTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
 
+    SAMPLE_HEADER = PATCH.OLD_SNIPPET + "\ntypedef struct {\n  int y;\n" + PATCH.DRAW_END + "\n"
+    SAMPLE_DECODER = (
+        PATCH.PALETTE_OLD
+        + PATCH.COPY_OLD
+        + "//\n// DecodeLZWTurbo\n"
+        + "            (*pImage->pfnDraw)(&gd); // callback to handle this line\n"
+        + "static void GIFMakePels(GIFIMAGE *pPage, unsigned int code);\n"
+        + "static void GIFMakePels(GIFIMAGE *pPage, unsigned int code)\n{\n"
+        + "            return; /* Exit with error */\n        }\n        *(--s) = gifpels[code];\n"
+        + "            return;\n        }\n        else  /* Pixels cross into next line */\n"
+        + "            if (pPage->pfnDraw) {\n"
+        + "                (*pPage->pfnDraw)(&gd); // callback to handle this line\n"
+        + "            }\n"
+        + "    return;\n} /* GIFMakePels() */\n"
+        + "    GIFMakePels(pImage, code); // first code is output as the first pixel\n"
+        + "            GIFMakePels(pImage, code);\n"
+    )
+
     def library(self, name="active"):
         library = self.root / name / "AnimatedGIF"
         source = library / "src"
         source.mkdir(parents=True)
-        (source / "AnimatedGIF.h").write_text(PATCH.OLD_SNIPPET)
-        (source / "gif.inl").write_text(PATCH.PALETTE_OLD + PATCH.COPY_OLD)
+        (source / "AnimatedGIF.h").write_text(self.SAMPLE_HEADER)
+        (source / "gif.inl").write_text(self.SAMPLE_DECODER)
         return library
 
     def test_active_environment_and_idempotence(self):
@@ -40,10 +58,11 @@ class PatchAnimatedGifTest(unittest.TestCase):
         first = {p.name: p.read_bytes() for p in (active / "src").iterdir()}
         self.assertTrue(PATCH.patch_animatedgif(env, require_found=True))
         self.assertEqual(first, {p.name: p.read_bytes() for p in (active / "src").iterdir()})
-        self.assertEqual((sibling / "src" / "AnimatedGIF.h").read_text(), PATCH.OLD_SNIPPET)
-        self.assertEqual((sibling / "src" / "gif.inl").read_text(), PATCH.PALETTE_OLD + PATCH.COPY_OLD)
+        self.assertEqual((sibling / "src" / "AnimatedGIF.h").read_text(), self.SAMPLE_HEADER)
+        self.assertEqual((sibling / "src" / "gif.inl").read_text(), self.SAMPLE_DECODER)
         self.assertIn(PATCH.PALETTE_NEW, first["gif.inl"].decode())
         self.assertIn(PATCH.COPY_NEW, first["gif.inl"].decode())
+        self.assertIn(PATCH.DRAW_END_WITH_ABORT, first["AnimatedGIF.h"].decode())
 
     def test_unknown_decoder_source_fails_without_rewriting_it(self):
         source = self.library() / "src" / "gif.inl"

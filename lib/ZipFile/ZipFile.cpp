@@ -21,6 +21,9 @@ constexpr uint16_t ZIP_METHOD_DEFLATED = 8;
 // Central directory header excluding the filename, extra field, and comment.
 constexpr size_t CENTRAL_HEADER_BYTES = 46;
 constexpr uint32_t CENTRAL_HEADER_SIGNATURE = 0x02014b50;
+constexpr uint32_t END_OF_DIRECTORY_SIGNATURE = 0x06054b50;
+constexpr uint32_t ZIP64_END_OF_DIRECTORY_SIGNATURE = 0x06064b50;
+constexpr uint32_t DIGITAL_SIGNATURE = 0x05054b50;
 
 uint16_t readLe16(const uint8_t* bytes) {
   uint16_t value;
@@ -83,7 +86,7 @@ bool ZipFile::loadAllFileStatSlims() {
   const ScopedOpenClose zip{*this};
   if (!zip) return false;
 
-  if (!loadZipDetails()) return false;
+  if (loadZipDetails() != StreamResult::Ok) return false;
 
   file.seek(zipDetails.centralDirOffset);
 
@@ -130,31 +133,31 @@ bool ZipFile::loadAllFileStatSlims() {
   return true;
 }
 
-bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
+ZipFile::StreamResult ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
   if (!fileStatSlimCache.empty()) {
     const auto it = fileStatSlimCache.find(filename);
     if (it != fileStatSlimCache.end()) {
       *fileStat = it->second;
-      return true;
+      return StreamResult::Ok;
     }
-    return false;
+    return StreamResult::NotFound;
   }
 
   if (lastLookupValid && lastLookupName == filename) {
     *fileStat = lastLookup;
-    return true;
+    return StreamResult::Ok;
   }
 
   const ScopedOpenClose zip{*this};
-  if (!zip) return false;
+  if (!zip) return StreamResult::IoError;
 
-  if (!loadZipDetails()) return false;
+  const auto details = loadZipDetails();
+  if (details != StreamResult::Ok) return details;
 
   // Phase 1: Try scanning from cursor position first
   const uint32_t startPos = lastCentralDirPosValid ? lastCentralDirPos : zipDetails.centralDirOffset;
   uint32_t entryStart = startPos;
   bool wrapped = false;
-  file.seek(entryStart);
 
   const size_t targetLen = strlen(filename);
   uint8_t header[CENTRAL_HEADER_BYTES];
@@ -164,24 +167,28 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
     // stop if we've wrapped and reached our start position
     if (wrapped && entryStart >= startPos) break;
 
-    if (file.read(header, sizeof(header)) != static_cast<int>(sizeof(header)) ||
-        readLe32(header) != CENTRAL_HEADER_SIGNATURE) {
-      // End of central directory
-      if (!wrapped && startPos != zipDetails.centralDirOffset) {
-        // Wrap around to beginning
-        entryStart = zipDetails.centralDirOffset;
-        file.seek(entryStart);
-        wrapped = true;
-        continue;
-      }
-      break;
+    if (!file.seek(entryStart)) return StreamResult::IoError;
+    const int headerRead = file.read(header, sizeof(header));
+    if (headerRead < static_cast<int>(sizeof(uint32_t))) return StreamResult::IoError;
+    const uint32_t signature = readLe32(header);
+    if (signature == END_OF_DIRECTORY_SIGNATURE || signature == ZIP64_END_OF_DIRECTORY_SIGNATURE ||
+        signature == DIGITAL_SIGNATURE) {
+      if (wrapped || startPos == zipDetails.centralDirOffset) break;
+      entryStart = zipDetails.centralDirOffset;
+      wrapped = true;
+      continue;
+    }
+    if (signature != CENTRAL_HEADER_SIGNATURE || headerRead != static_cast<int>(sizeof(header))) {
+      return StreamResult::IoError;
     }
 
     const uint16_t nameLen = readLe16(header + 28);
     const uint16_t extraLen = readLe16(header + 30);
     const uint16_t commentLen = readLe16(header + 32);
     // skip name, extra field + comment
-    const uint32_t nextEntry = entryStart + sizeof(header) + nameLen + extraLen + commentLen;
+    const size_t entrySize = sizeof(header) + nameLen + extraLen + commentLen;
+    if (entrySize > UINT32_MAX - entryStart) return StreamResult::IoError;
+    const uint32_t nextEntry = entryStart + entrySize;
 
     // Skip names that are too long or cannot match by length
     if (nameLen == targetLen && nameLen < sizeof(itemName)) {
@@ -189,7 +196,7 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
       if (nameRead != static_cast<int>(nameLen)) {
         LOG_ERR("ZIP", "Failed to read entry name for %s: expected %u bytes, got %d", filename,
                 static_cast<unsigned int>(nameLen), nameRead);
-        break;
+        return StreamResult::IoError;
       }
       if (memcmp(itemName, filename, nameLen) == 0) {
         // Found it! Update cursor to next entry
@@ -202,15 +209,14 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
         lastLookupName.assign(filename, nameLen);
         lastLookup = *fileStat;
         lastLookupValid = true;
-        return true;
+        return StreamResult::Ok;
       }
     }
 
     entryStart = nextEntry;
-    file.seek(entryStart);
   }
 
-  return false;
+  return StreamResult::NotFound;
 }
 
 long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
@@ -222,7 +228,7 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   uint8_t pLocalHeader[localHeaderSize];
   const uint64_t fileOffset = fileStat.localHeaderOffset;
 
-  file.seek(fileOffset);
+  if (!file.seek(fileOffset)) return -1;
   const size_t read = file.read(pLocalHeader, localHeaderSize);
 
   if (read != localHeaderSize) {
@@ -241,37 +247,35 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   return fileOffset + localHeaderSize + filenameLength + extraOffset;
 }
 
-bool ZipFile::loadZipDetails() {
+ZipFile::StreamResult ZipFile::loadZipDetails() {
   if (zipDetails.isSet) {
-    return true;
+    return StreamResult::Ok;
   }
 
   const ScopedOpenClose zip{*this};
-  if (!zip) return false;
+  if (!zip) return StreamResult::IoError;
 
   const size_t fileSize = file.size();
   if (fileSize < 22) {
     LOG_ERR("ZIP", "File too small to be a valid zip");
-    return false;  // Minimum EOCD size is 22 bytes
+    return StreamResult::IoError;  // Minimum EOCD size is 22 bytes
   }
 
   // We scan the last 1KB (or the whole file if smaller) for the EOCD signature
   // 0x06054b50 is stored as 0x50, 0x4b, 0x05, 0x06 in little-endian
   const int scanRange = fileSize > 1024 ? 1024 : fileSize;
-  const auto buffer = static_cast<uint8_t*>(malloc(scanRange));
+  const auto buffer = makeUniqueNoThrow<uint8_t[]>(scanRange);
   if (!buffer) {
     LOG_ERR("ZIP", "Failed to allocate memory for EOCD scan buffer");
-    return false;
+    return StreamResult::OutOfMemory;
   }
 
-  file.seek(fileSize - scanRange);
-  file.read(buffer, scanRange);
+  if (!file.seek(fileSize - scanRange) || file.read(buffer.get(), scanRange) != scanRange) return StreamResult::IoError;
 
   // Scan backwards for the signature
   int foundOffset = -1;
   for (int i = scanRange - 22; i >= 0; i--) {
-    constexpr uint32_t signature = 0x06054b50;
-    if (*reinterpret_cast<uint32_t*>(&buffer[i]) == signature) {
+    if (readLe32(buffer.get() + i) == END_OF_DIRECTORY_SIGNATURE) {
       foundOffset = i;
       break;
     }
@@ -279,20 +283,23 @@ bool ZipFile::loadZipDetails() {
 
   if (foundOffset == -1) {
     LOG_ERR("ZIP", "EOCD signature not found in zip file");
-    free(buffer);
-    return false;
+    return StreamResult::IoError;
   }
 
   // Now extract the values we need from the EOCD record
   // Relative positions within EOCD:
   // Offset 10: Total number of entries (2 bytes)
   // Offset 16: Offset of start of central directory with respect to the starting disk number (4 bytes)
-  zipDetails.totalEntries = *reinterpret_cast<uint16_t*>(&buffer[foundOffset + 10]);
-  zipDetails.centralDirOffset = *reinterpret_cast<uint32_t*>(&buffer[foundOffset + 16]);
+  const auto* eocd = buffer.get() + foundOffset;
+  const auto directorySize = readLe32(eocd + 12);
+  const auto directoryOffset = readLe32(eocd + 16);
+  const size_t eocdOffset = fileSize - scanRange + foundOffset;
+  if (directoryOffset > eocdOffset || directorySize > eocdOffset - directoryOffset) return StreamResult::IoError;
+  zipDetails.totalEntries = readLe16(eocd + 10);
+  zipDetails.centralDirOffset = directoryOffset;
   zipDetails.isSet = true;
 
-  free(buffer);
-  return true;
+  return StreamResult::Ok;
 }
 
 bool ZipFile::open() {
@@ -316,7 +323,7 @@ bool ZipFile::close() {
 
 bool ZipFile::getInflatedFileSize(const char* filename, size_t* size) {
   FileStatSlim fileStat = {};
-  if (!loadFileStatSlim(filename, &fileStat)) {
+  if (loadFileStatSlim(filename, &fileStat) != StreamResult::Ok) {
     return false;
   }
 
@@ -332,7 +339,7 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
   const ScopedOpenClose zip{*this};
   if (!zip) return 0;
 
-  if (!loadZipDetails()) return 0;
+  if (loadZipDetails() != StreamResult::Ok) return 0;
 
   file.seek(zipDetails.centralDirOffset);
 
@@ -397,7 +404,7 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
   if (!zip) return nullptr;
 
   FileStatSlim fileStat = {};
-  if (!loadFileStatSlim(filename, &fileStat)) return nullptr;
+  if (loadFileStatSlim(filename, &fileStat) != StreamResult::Ok) return nullptr;
 
   const long fileOffset = getDataOffset(fileStat);
   if (fileOffset < 0) return nullptr;
@@ -470,97 +477,85 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
 }
 
 bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t chunkSize, const bool allowEarlyStop) {
-  return streamFile(filename, out, chunkSize, allowEarlyStop, nullptr) == StreamResult::Ok;
-}
-
-ZipFile::StreamResult ZipFile::readFileToStreamDetailed(const char* filename, Print& out, const size_t chunkSize,
-                                                        bool (*shouldAbort)()) {
-  return streamFile(filename, out, chunkSize, false, shouldAbort);
+  return streamFile(filename, out, chunkSize, allowEarlyStop) == StreamResult::Ok;
 }
 
 ZipFile::StreamResult ZipFile::streamFile(const char* filename, Print& out, const size_t chunkSize,
-                                          const bool allowEarlyStop, bool (*shouldAbort)()) {
-  if (!chunkSize) return StreamResult::Error;
-  if (shouldAbort && shouldAbort()) return StreamResult::Aborted;
+                                          const bool allowEarlyStop) {
+  if (!chunkSize) return StreamResult::IoError;
   const ScopedOpenClose zip{*this};
-  if (!zip) return StreamResult::Error;
+  if (!zip) return StreamResult::IoError;
 
   FileStatSlim stat{};
-  if (!loadFileStatSlim(filename, &stat)) return StreamResult::Error;
+  const auto lookup = loadFileStatSlim(filename, &stat);
+  if (lookup != StreamResult::Ok) return lookup;
   const long fileOffset = getDataOffset(stat);
-  if (fileOffset < 0 || !file.seek(fileOffset)) return StreamResult::Error;
+  if (fileOffset < 0 || !file.seek(fileOffset)) return StreamResult::IoError;
   if (stat.method != ZIP_METHOD_STORED && stat.method != ZIP_METHOD_DEFLATED) {
     LOG_ERR("ZIP", "Unsupported compression method");
-    return StreamResult::Error;
+    return StreamResult::IoError;
   }
 
   auto buffer = makeUniqueNoThrow<uint8_t[]>(chunkSize);
   if (!buffer) {
     LOG_ERR("ZIP", "Failed to allocate ZIP stream buffer");
-    return StreamResult::Error;
+    return StreamResult::OutOfMemory;
   }
 
-  unsigned chunks = 0;
-  const auto pollAbort = [&]() { return shouldAbort && chunks > 0 && chunks % 8 == 0 && shouldAbort(); };
-  const auto finish = [&]() { return shouldAbort && shouldAbort() ? StreamResult::Aborted : StreamResult::Ok; };
   const auto shortWrite = [&]() {
     if (allowEarlyStop) return StreamResult::Ok;
     LOG_ERR("ZIP", "Failed to write all output bytes to stream");
-    return StreamResult::Error;
+    return StreamResult::IoError;
   };
 
   if (stat.method == ZIP_METHOD_STORED) {
     size_t remaining = stat.uncompressedSize;
     while (remaining > 0) {
-      if (pollAbort()) return StreamResult::Aborted;
-      ++chunks;
       const int result = file.read(buffer.get(), std::min(remaining, chunkSize));
       if (result <= 0) {
         LOG_ERR("ZIP", "Could not read more bytes");
-        return StreamResult::Error;
+        return StreamResult::IoError;
       }
       const auto count = static_cast<size_t>(result);
       if (out.write(buffer.get(), count) != count) return shortWrite();
       remaining -= count;
     }
-    return finish();
+    return StreamResult::Ok;
   }
 
   auto readBuffer = makeUniqueNoThrow<uint8_t[]>(chunkSize);
   if (!readBuffer) {
     LOG_ERR("ZIP", "Failed to allocate ZIP input buffer");
-    return StreamResult::Error;
+    return StreamResult::OutOfMemory;
   }
   ZipInflateCtx ctx{&file, stat.compressedSize, readBuffer.get(), chunkSize};
   InflateStream inflate;
   if (!inflate.init(true)) {
     LOG_ERR("ZIP", "Failed to init inflate stream for %s", filename);
-    return StreamResult::Error;
+    return StreamResult::OutOfMemory;
   }
   inflate.setFill(zipFillCallback, &ctx);
 
   size_t remaining = stat.uncompressedSize;
   for (;;) {
-    if (pollAbort()) return StreamResult::Aborted;
-    ++chunks;
     size_t produced = 0;
     const InflateStream::Status status = inflate.readAtMost(buffer.get(), chunkSize, &produced);
     if (produced > remaining) {
       LOG_ERR("ZIP", "Decompressed size exceeds expected size");
-      return StreamResult::Error;
+      return StreamResult::IoError;
     }
     if (produced > 0 && out.write(buffer.get(), produced) != produced) return shortWrite();
     remaining -= produced;
     if (status == InflateStream::Status::Done) {
       if (remaining != 0) {
         LOG_ERR("ZIP", "Decompressed size mismatch (%zu bytes missing)", remaining);
-        return StreamResult::Error;
+        return StreamResult::IoError;
       }
-      return finish();
+      return StreamResult::Ok;
     }
     if (status == InflateStream::Status::Error) {
       LOG_ERR("ZIP", "Decompression failed");
-      return StreamResult::Error;
+      return StreamResult::IoError;
     }
   }
 }

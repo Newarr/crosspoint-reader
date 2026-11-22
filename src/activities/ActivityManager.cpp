@@ -103,8 +103,6 @@ void ActivityManager::renderTaskLoop() {
 }
 
 void ActivityManager::loop() {
-  if (mappedInput.consumeSuppressedRelease() && pendingAction != PendingAction::ReplaceForSleep) return;
-
   if (currentActivity && currentActivity->requiresExclusiveStorageLoop()) {
     currentActivity->loop();
     // An exclusive-storage activity must restart rather than navigate away:
@@ -355,17 +353,19 @@ void ActivityManager::goToSleep(bool fromTimeout) {
 
 bool ActivityManager::showStandbyScreen() {
   RenderLock lock;
-  if (!currentActivity || pendingAction != PendingAction::None) return false;
+  if (!currentActivity || pendingAction != PendingAction::None || !currentActivity->supportsStandbyResume())
+    return false;
   standbyScreenActive = true;
   SleepActivity(renderer, mappedInput).onEnter();
   return true;
 }
 
-void ActivityManager::finishStandby(bool woke) {
+void ActivityManager::finishStandby(bool woke, bool fastWake) {
   RenderLock lock;
   standbyScreenActive = false;
   if (woke) {
     ++screenVisit;
+    currentActivity->onStandbyResume(fastWake);
     requestUpdate(true);
     return;
   }
@@ -493,16 +493,18 @@ ScreenshotInfo ActivityManager::getScreenshotInfo() const {
   return {};
 }
 
-void ActivityManager::ensureFreshFrameBuffer() {
-  if (currentActivity) {
-    currentActivity->ensureFreshFrameBuffer();
-  }
+bool ActivityManager::ensureFreshFrameBuffer() {
+  return currentActivity ? currentActivity->ensureFreshFrameBuffer() : true;
 }
 
-void ActivityManager::prepareForSleep() {
+bool ActivityManager::prepareForSleep() {
   RenderLock lock;
   for (const auto& activity : stackActivities) activity->prepareForSleep();
-  if (currentActivity) currentActivity->prepareForSleep();
+  if (currentActivity) {
+    currentActivity->prepareForSleep();
+    return currentActivity->ensureFreshFrameBuffer();
+  }
+  return true;
 }
 
 void ActivityManager::requestUpdate(bool immediate) {

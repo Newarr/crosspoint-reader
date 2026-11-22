@@ -35,6 +35,7 @@ class GfxRenderer {
     return left == 0 || left == ' ' || right == ' ' ? 0 : tracking;
   }
   bool isFontCacheScanning() const { return false; }
+  void releaseWordWidthCache() const {}
   mutable int lastLineY = -1;
   mutable int drawnLineCount = 0;
   void drawLine(int, int y, int, int, int, bool) const {

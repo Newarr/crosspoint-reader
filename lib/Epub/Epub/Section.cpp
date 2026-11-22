@@ -90,7 +90,7 @@ namespace {
 //      marks, in the book's language; reordered vowel signs for fonts without shaping
 //      data), and TextBlocks store each complex-script word's drawn form so page turns
 //      never shape.
-constexpr uint8_t SECTION_FILE_VERSION = 77;
+constexpr uint8_t SECTION_FILE_VERSION = 78;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -166,10 +166,10 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   return position;
 }
 
-void Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
+bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
   if (!file) {
     LOG_DBG("SCT", "File not open for writing header");
-    return;
+    return false;
   }
   static_assert(HEADER_SIZE == sizeof(SECTION_FILE_VERSION) + sizeof(spec.fontId) + sizeof(spec.lineCompression) +
                                    sizeof(spec.extraParagraphSpacing) + sizeof(spec.paragraphIndentSpaces) +
@@ -182,27 +182,22 @@ void Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
                 "Header size mismatch");
   // Written as the incomplete sentinel; finalizeBuild() patches it to
   // SECTION_FILE_VERSION as the last step, committing the file.
-  serialization::writePod(file, SECTION_FILE_INCOMPLETE_VERSION);
-  serialization::writePod(file, spec.fontId);
-  serialization::writePod(file, spec.lineCompression);
-  serialization::writePod(file, spec.extraParagraphSpacing);
-  serialization::writePod(file, spec.paragraphIndentSpaces);
-  serialization::writePod(file, spec.paragraphAlignment);
-  serialization::writePod(file, spec.viewportWidth);
-  serialization::writePod(file, spec.viewportHeight);
-  serialization::writePod(file, spec.hyphenationEnabled);
-  serialization::writePod(file, spec.embeddedStyle);
-  serialization::writePod(file, spec.imageRendering);
-  serialization::writePod(file, spec.focusReadingEnabled);
-  serialization::writePod(file, spec.collectTouchLinks);
-  serialization::writePod(file, spec.characterSpacing);
-  serialization::writePod(file, spec.wordSpacingPercent);
-  serialization::writePod(file, pageCount);  // Placeholder for page count (will be initially 0, patched later)
-  serialization::writePod(file, static_cast<uint32_t>(0));  // Placeholder for LUT offset (patched later)
-  serialization::writePod(file, static_cast<uint32_t>(0));  // Placeholder for anchor map offset (patched later)
-  serialization::writePod(file, static_cast<uint32_t>(0));  // Placeholder for paragraph LUT offset (patched later)
-  serialization::writePod(file, static_cast<uint32_t>(0));  // Placeholder for li LUT offset (patched later)
-  serialization::writePod(file, static_cast<uint32_t>(0));  // Placeholder for visible-offset LUT (patched later)
+  const uint32_t offsets[5] = {};
+  return serialization::tryWritePod(file, SECTION_FILE_INCOMPLETE_VERSION) &&
+         serialization::tryWritePod(file, spec.fontId) && serialization::tryWritePod(file, spec.lineCompression) &&
+         serialization::tryWritePod(file, spec.extraParagraphSpacing) &&
+         serialization::tryWritePod(file, spec.paragraphIndentSpaces) &&
+         serialization::tryWritePod(file, spec.paragraphAlignment) &&
+         serialization::tryWritePod(file, spec.viewportWidth) &&
+         serialization::tryWritePod(file, spec.viewportHeight) &&
+         serialization::tryWritePod(file, spec.hyphenationEnabled) &&
+         serialization::tryWritePod(file, spec.embeddedStyle) &&
+         serialization::tryWritePod(file, spec.imageRendering) &&
+         serialization::tryWritePod(file, spec.focusReadingEnabled) &&
+         serialization::tryWritePod(file, spec.collectTouchLinks) &&
+         serialization::tryWritePod(file, spec.characterSpacing) &&
+         serialization::tryWritePod(file, spec.wordSpacingPercent) && serialization::tryWritePod(file, pageCount) &&
+         file.write(offsets, sizeof(offsets)) == sizeof(offsets);
 }
 
 bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
@@ -224,42 +219,22 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
     }
     filePartial = (version == SECTION_FILE_PARTIAL_VERSION);
 
-    int fileFontId;
-    uint16_t fileViewportWidth, fileViewportHeight;
-    float fileLineCompression;
-    bool fileExtraParagraphSpacing;
-    uint8_t fileParagraphIndentSpaces;
-    uint8_t fileParagraphAlignment;
-    bool fileHyphenationEnabled;
-    bool fileEmbeddedStyle;
-    uint8_t fileImageRendering;
-    bool fileFocusReadingEnabled;
-    bool fileCollectTouchLinks;
-    int8_t fileCharacterSpacing;
-    uint8_t fileWordSpacingPercent;
-    serialization::readPod(file, fileFontId);
-    serialization::readPod(file, fileLineCompression);
-    serialization::readPod(file, fileExtraParagraphSpacing);
-    serialization::readPod(file, fileParagraphIndentSpaces);
-    serialization::readPod(file, fileParagraphAlignment);
-    serialization::readPod(file, fileViewportWidth);
-    serialization::readPod(file, fileViewportHeight);
-    serialization::readPod(file, fileHyphenationEnabled);
-    serialization::readPod(file, fileEmbeddedStyle);
-    serialization::readPod(file, fileImageRendering);
-    serialization::readPod(file, fileFocusReadingEnabled);
-    serialization::readPod(file, fileCollectTouchLinks);
-    serialization::readPod(file, fileCharacterSpacing);
-    serialization::readPod(file, fileWordSpacingPercent);
-
-    if (spec.fontId != fileFontId || spec.lineCompression != fileLineCompression ||
-        spec.extraParagraphSpacing != fileExtraParagraphSpacing ||
-        spec.paragraphIndentSpaces != fileParagraphIndentSpaces || spec.paragraphAlignment != fileParagraphAlignment ||
-        spec.viewportWidth != fileViewportWidth || spec.viewportHeight != fileViewportHeight ||
-        spec.hyphenationEnabled != fileHyphenationEnabled || spec.embeddedStyle != fileEmbeddedStyle ||
-        spec.imageRendering != fileImageRendering || spec.focusReadingEnabled != fileFocusReadingEnabled ||
-        spec.collectTouchLinks != fileCollectTouchLinks || spec.characterSpacing != fileCharacterSpacing ||
-        spec.wordSpacingPercent != fileWordSpacingPercent) {
+    ReaderRenderSpec storedSpec;
+    const bool readSpec = serialization::tryReadPod(file, storedSpec.fontId) &&
+                          serialization::tryReadPod(file, storedSpec.lineCompression) &&
+                          serialization::tryReadPod(file, storedSpec.extraParagraphSpacing) &&
+                          serialization::tryReadPod(file, storedSpec.paragraphIndentSpaces) &&
+                          serialization::tryReadPod(file, storedSpec.paragraphAlignment) &&
+                          serialization::tryReadPod(file, storedSpec.viewportWidth) &&
+                          serialization::tryReadPod(file, storedSpec.viewportHeight) &&
+                          serialization::tryReadPod(file, storedSpec.hyphenationEnabled) &&
+                          serialization::tryReadPod(file, storedSpec.embeddedStyle) &&
+                          serialization::tryReadPod(file, storedSpec.imageRendering) &&
+                          serialization::tryReadPod(file, storedSpec.focusReadingEnabled) &&
+                          serialization::tryReadPod(file, storedSpec.collectTouchLinks) &&
+                          serialization::tryReadPod(file, storedSpec.characterSpacing) &&
+                          serialization::tryReadPod(file, storedSpec.wordSpacingPercent);
+    if (!readSpec || spec != storedSpec) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: Parameters do not match");
       clearCache();
@@ -407,12 +382,12 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
       // single-spine novel into ~570 tiny writes (multi-second). 8KB keeps the transient buffers
       // small while cutting the write count 8x.
       ChapterExtractionSink sink(tmpHtml, shouldAbort);
-      streamed = epub->readItemContentsToStream(localPath, sink, 8192);
+      const auto result = epub->streamItemContents(localPath, sink, 8192);
       fileSize = tmpHtml.size();
       // Explicitly close() file before calling Storage.remove()
       const bool closed = tmpHtml.close();
       const bool aborted = sink.wasAborted() || canceled();
-      streamed = streamed && closed && !aborted;
+      streamed = result == Epub::ReadStreamResult::Ok && closed && !aborted;
 
       // If streaming failed, remove the incomplete file immediately
       if (!streamed && Storage.exists(tmpHtmlPath.c_str())) {
@@ -423,6 +398,12 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
         lastBuildError_ = BuildError::Aborted;
         return false;
       }
+      if (result == Epub::ReadStreamResult::OutOfMemory) {
+        renderer.releaseWordWidthCache();
+        lastBuildError_ = BuildError::OutOfMemory;
+        return false;
+      }
+      if (result == Epub::ReadStreamResult::NotFound) return false;
     }
 
     if (!streamed) {
@@ -450,6 +431,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   auto ctx = makeUniqueNoThrow<BuildContext>();
   if (!ctx) {
     LOG_ERR("SCT", "OOM: BuildContext");
+    renderer.releaseWordWidthCache();
     lastBuildError_ = BuildError::OutOfMemory;
     if (!htmlCached) Storage.remove(tmpHtmlPath.c_str());
     return false;
@@ -479,7 +461,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
           abandonBuild(true);
           return false;
         }
-        const bool reloaded = epub->load(false);
+        const bool reloaded = epub->repairCssCache();
         if (partial_ && !Storage.exists(filePath.c_str())) {
           partial_ = false;
           partialPageCount_ = 0;
@@ -509,13 +491,10 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     abandonBuild(true);
     return false;
   }
-  writeSectionFileHeader(spec);
+  if (!writeSectionFileHeader(spec)) return failBuild(BuildError::Other);
   Hyphenator::setPreferredLanguage(epub->getLanguage());
   ComplexShaper::setDocumentLanguage(epub->getLanguage().c_str());
-  if (!beginChapterParse(popupFn)) {
-    abandonBuild(true);
-    return false;
-  }
+  if (!beginChapterParse(popupFn)) return failBuild(lastBuildError_);
   lastBuildError_ = BuildError::None;
   return true;
 }
@@ -588,17 +567,17 @@ bool Section::retryNormalizedChapter(bool (*yieldNow)()) {
       ctx.parsePath = normalizedPath;
       break;
   }
-  if (!file.seek(0) || !file.truncate(0)) {
+  if (!file.seek(0) || !file.truncate(0) || !writeSectionFileHeader(ctx.spec)) {
     lastBuildError_ = BuildError::Other;
     return false;
   }
-  writeSectionFileHeader(ctx.spec);
   return beginChapterParse(nullptr);
 }
 
 bool Section::failBuild(const BuildError error) {
   lastBuildError_ = error;
-  abandonBuild(error == BuildError::OutOfMemory || error == BuildError::Aborted);
+  if (error == BuildError::OutOfMemory) renderer.releaseWordWidthCache();
+  abandonBuild(true);
   return false;
 }
 
@@ -637,8 +616,7 @@ bool Section::buildSomeMore(const int maxPages, bool (*yieldNow)()) {
         build_->smoothedAtConsumed = 0;
         builtPageCount_ = 0;
         pageCount = partial_ ? partialPageCount_ : 0;
-        renderer.clearWidthCache();
-        renderer.setWidthCacheEnabled(false);
+        renderer.releaseWordWidthCache();
         if (auto* fontCache = renderer.getFontCacheManager()) fontCache->releaseSdFontCaches();
         if (yieldNow) return true;
         continue;

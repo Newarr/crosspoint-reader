@@ -1,19 +1,12 @@
 #include "HalOtaSlot.h"
 
+#include <esp_app_format.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_rom_crc.h>
 
 namespace {
 const esp_partition_t* asPartition(const void* partition) { return static_cast<const esp_partition_t*>(partition); }
-
-struct OtaSelectEntry {
-  uint32_t ota_seq;
-  uint8_t seq_label[20];
-  uint32_t ota_state;
-  uint32_t crc;
-};
-static_assert(sizeof(OtaSelectEntry) == 32);
 
 constexpr HalOtaSlot::RunningImageState classifyImageState(esp_ota_img_states_t state) {
   switch (state) {
@@ -48,47 +41,48 @@ HalOtaSlot HalOtaSlot::inactive() {
   return HalOtaSlot(partition, partition->size);
 }
 
-HalOtaSlot::RunningImageState HalOtaSlot::runningImageState() {
-  const esp_partition_t* running = esp_ota_get_running_partition();
-  if (!running || esp_ota_get_boot_partition() != running) return RunningImageState::Unsafe;
+uint32_t HalOtaSlot::sequenceCrc(uint32_t sequence) {
+  return esp_rom_crc32_le(UINT32_MAX, reinterpret_cast<const uint8_t*>(&sequence), sizeof(sequence));
+}
 
-  const esp_partition_t* otadata =
-      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
-  const size_t appCount = esp_ota_get_app_partition_count();
-  if (!otadata || otadata->size < 2 * ERASE_SIZE || appCount == 0 ||
-      running->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN) {
-    return RunningImageState::Unsafe;
-  }
+bool HalOtaSlot::readBootSelection(BootSelection& selection) {
+  selection = {};
+  selection.partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
+  selection.appCount = esp_ota_get_app_partition_count();
+  if (!selection.partition || selection.partition->size < 2 * ERASE_SIZE || selection.appCount == 0) return false;
 
-  // Classify the highest-sequence active otadata record directly because
-  // esp_ota_get_state_partition() returns the first matching slot rather than the newest.
-  OtaSelectEntry slots[2] = {};
-  if (esp_partition_read(otadata, 0, &slots[0], sizeof(slots[0])) != ESP_OK ||
-      esp_partition_read(otadata, ERASE_SIZE, &slots[1], sizeof(slots[1])) != ESP_OK) {
-    return RunningImageState::Unsafe;
-  }
-
-  int activeIdx = -1;
-  uint32_t activeSeq = 0;
-  for (int i = 0; i < 2; ++i) {
-    if (slots[i].ota_seq == UINT32_MAX || slots[i].ota_seq == 0) continue;
-    const uint32_t crc =
-        esp_rom_crc32_le(UINT32_MAX, reinterpret_cast<const uint8_t*>(&slots[i].ota_seq), sizeof(slots[i].ota_seq));
-    if (slots[i].crc != crc) continue;
-    if (slots[i].ota_state == ESP_OTA_IMG_INVALID || slots[i].ota_state == ESP_OTA_IMG_ABORTED) continue;
-    if (activeIdx < 0 || slots[i].ota_seq > activeSeq) {
-      activeIdx = i;
-      activeSeq = slots[i].ota_seq;
+  for (int index = 0; index < 2; ++index) {
+    esp_ota_select_entry_t entry{};
+    if (esp_partition_read(selection.partition, index * ERASE_SIZE, &entry, sizeof(entry)) != ESP_OK) return false;
+    if (entry.ota_seq == 0 || entry.ota_seq == UINT32_MAX || entry.crc != sequenceCrc(entry.ota_seq) ||
+        entry.ota_state == ESP_OTA_IMG_INVALID || entry.ota_state == ESP_OTA_IMG_ABORTED) {
+      continue;
+    }
+    if (entry.ota_seq > selection.active.ota_seq) {
+      selection.activeIndex = index;
+      selection.active = entry;
     }
   }
-  if (activeIdx < 0) {
+  return true;
+}
+
+HalOtaSlot::RunningImageState HalOtaSlot::runningImageState() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || esp_ota_get_boot_partition() != running || running->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN) {
+    return RunningImageState::Unsafe;
+  }
+
+  // The IDF state query can return an older record when both slots select the same app.
+  BootSelection selection;
+  if (!readBootSelection(selection)) return RunningImageState::Unsafe;
+  if (selection.activeIndex < 0) {
     return running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ? RunningImageState::Untracked
                                                                : RunningImageState::Unsafe;
   }
 
-  const size_t runningSlot = static_cast<size_t>(running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
-  if (((activeSeq - 1u) % appCount) != runningSlot) return RunningImageState::Unsafe;
-  return classifyImageState(static_cast<esp_ota_img_states_t>(slots[activeIdx].ota_state));
+  const size_t runningSlot = running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN;
+  if ((selection.active.ota_seq - 1u) % selection.appCount != runningSlot) return RunningImageState::Unsafe;
+  return classifyImageState(static_cast<esp_ota_img_states_t>(selection.active.ota_state));
 }
 
 bool HalOtaSlot::confirmRunningImage() {
@@ -97,7 +91,12 @@ bool HalOtaSlot::confirmRunningImage() {
 }
 
 bool HalOtaSlot::safeForScratchWrite() const {
-  if (!valid() || asPartition(partition_)->encrypted) return false;
+  const auto* partition = asPartition(partition_);
+  uint8_t header[4];
+  if (!contains(0, sizeof(header)) || partition->encrypted ||
+      esp_partition_read(partition, 0, header, sizeof(header)) != ESP_OK || header[0] == ESP_IMAGE_HEADER_MAGIC) {
+    return false;
+  }
 
   switch (runningImageState()) {
     case RunningImageState::Confirmed:

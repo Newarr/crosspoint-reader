@@ -18,6 +18,7 @@ for signature, following in (
     ("bool MappedInputManager::isPressed(", "MappedInputManager::Labels MappedInputManager::mapLabels("),
 ):
     methods.append(signature + source.split(signature, 1)[1].split(following, 1)[0])
+methods.append("uint8_t MappedInputManager::countButtonEdges(" + source.split("uint8_t MappedInputManager::countButtonEdges(", 1)[1])
 methods.append("#if FREEINK_CAP_TOUCH\n" + "bool MappedInputManager::wasPowerConfirmClick() const" + source.split(
     "bool MappedInputManager::wasPowerConfirmClick() const", 1
 )[1].split("#endif", 1)[0] + "#endif\n")
@@ -27,15 +28,26 @@ stub = r"""
 #include <cstdint>
 struct HalGPIO {
   enum { BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_POWER };
+  struct ButtonTransition {
+    uint8_t button = 0;
+    uint8_t pressed = 0;
+    uint32_t timestampMs = 0;
+  };
   bool pressed = false, released = false, held = false;
   bool physicalPowerHeld = false;
   uint8_t button = 0;
   unsigned long powerHeldMs = 20;
   void update() {}
+  bool deviceIsX3() const { return false; }
+  uint8_t frameTransitionCount() const { return 0; }
+  ButtonTransition frameTransition(uint8_t) const { return {}; }
+  bool frameTransitionsOverflowed() const { return false; }
   bool wasAnyPressed() const { return pressed; }
   bool wasAnyReleased() const { return released; }
   bool wasPressed(uint8_t b) const { return b == button && pressed; }
   bool wasReleased(uint8_t b) const { return b == button && released; }
+  uint8_t wasPressedCount(uint8_t b) const { return wasPressed(b) ? 1 : 0; }
+  uint8_t wasReleasedCount(uint8_t b) const { return wasReleased(b) ? 1 : 0; }
   bool isPressed(uint8_t b) const { return b == button && held; }
   bool isPowerButtonPhysicallyPressed() const { return physicalPowerHeld; }
   bool hasTouch() const { return true; }
@@ -49,6 +61,7 @@ struct HalGPIO {
 };
 """
 harness = r"""
+#include <algorithm>
 #include <cassert>
 #include "MappedInputManager.h"
 class GfxRenderer {};
@@ -80,6 +93,10 @@ struct HalHaptics {
 };
 bool MappedInputManager::mapButton(Button b, bool (HalGPIO::*fn)(uint8_t) const) const {
   return (gpio.*fn)(static_cast<uint8_t>(b));
+}
+uint8_t MappedInputManager::physicalButtons(Button b) const {
+  const auto index = static_cast<uint8_t>(b);
+  return index <= HalGPIO::BTN_POWER ? static_cast<uint8_t>(1u << index) : 0;
 }
 bool MappedInputManager::wasBackGesture() const { return false; }
 MappedInputManager::SwipeDir MappedInputManager::wasSwipe(int*, int*) const { return SwipeDir::None; }
@@ -388,9 +405,7 @@ wake_validation = main_source.index("  switch (wakeupReason) {")
 wake_validation_end = main_source.index("\n  }\n", wake_validation) + len("\n  }\n")
 frontlight_init = main_source.index("  Frontlight.begin(")
 assert wake_validation_end < frontlight_init < main_source.index("  handleSlideSwitch();", wake_validation_end)
-release_guard = main_source.split("  if (mappedInputManager.wasPowerReleaseConsumed()) {", 1)[1].split(
-    "  if (mappedInputManager.powerSleepClick()) {", 1)[0]
-sleep_dispatch = main_source.split("  const bool awaitingClickWindow =", 1)[1].split(
+sleep_dispatch = main_source.split("  if (millis() >= allowSleepAt && mappedInputManager.powerSleepRequested()) {", 1)[1].split(
     "#if FREEINK_DEVICE_PAPERMONO", 1)[0]
 dispatch_harness = r"""
 bool slept = false, forwardedRelease = false;
@@ -398,10 +413,15 @@ void enterDeepSleep() { slept = true; }
 #define LOG_DBG(...) ((void)0)
 void dispatchSleep(MappedInputManager& mappedInputManager, HalGPIO& gpio,
                    bool powerDoubleClickEnabled, unsigned long allowSleepAt) {
+  (void)powerDoubleClickEnabled;
   slept = forwardedRelease = false;
-  if (mappedInputManager.wasPowerReleaseConsumed()) {
-""" + release_guard + "  const bool awaitingClickWindow =" + sleep_dispatch + r"""
-  forwardedRelease = true;
+  if (mappedInputManager.powerSleepClick()) {
+    enterDeepSleep();
+    return;
+  }
+  if (millis() >= allowSleepAt && mappedInputManager.powerSleepRequested()) {
+""" + sleep_dispatch + r"""
+  forwardedRelease = !mappedInputManager.wasPowerReleaseConsumed();
 }
 void checkSleepDispatch(MappedInputManager& input, HalGPIO& gpio) {
   dispatchSleep(input, gpio, false, 0);
@@ -413,12 +433,18 @@ void checkSleepDispatch(MappedInputManager& input, HalGPIO& gpio) {
   input.beginPowerInput(true, true);
   input.update();
   dispatchSleep(input, gpio, false, 0);
-  assert(!slept && !forwardedRelease);
+  assert(!slept);
   input.beginPowerInput(false, false);
+  const auto savedStyle = BoardConfig::ACTIVE.inputStyle;
+  const auto savedDouble = SETTINGS.doublePwrBtn;
+  BoardConfig::ACTIVE.inputStyle = BoardConfig::InputStyle::DigitalButtons;
+  SETTINGS.doublePwrBtn = CrossPointSettings::PAGE_TURN;
   gpio.powerHeldMs = 150;
   input.update();
   dispatchSleep(input, gpio, true, 0);
   assert(!slept);  // Short click still waits for X4 Pro's double-click window.
+  BoardConfig::ACTIVE.inputStyle = savedStyle;
+  SETTINGS.doublePwrBtn = savedDouble;
 }
 """
 harness = harness.replace("void checkRemoteButtons() {", dispatch_harness + "void checkRemoteButtons() {")

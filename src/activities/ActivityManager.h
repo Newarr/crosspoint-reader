@@ -97,7 +97,7 @@ class ActivityManager {
   void goToReader(std::string path, bool allowFastInitialRefresh = false);
   void goToSleep(bool fromTimeout = false);
   bool showStandbyScreen();
-  void finishStandby(bool woke);
+  void finishStandby(bool woke, bool fastWake = false);
   void goToBoot();
   void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
   void goToCrashReport();
@@ -127,8 +127,8 @@ class ActivityManager {
   bool handleForcedRefresh();
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;
-  void ensureFreshFrameBuffer();
-  void prepareForSleep();
+  bool ensureFreshFrameBuffer();
+  bool prepareForSleep();
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.

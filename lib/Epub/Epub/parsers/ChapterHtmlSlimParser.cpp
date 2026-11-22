@@ -17,13 +17,13 @@
 #include <iterator>
 #include <new>
 
+#include "ChapterXmlEntities.h"
 #include "Epub.h"
 #include "Epub/Page.h"
 #include "Epub/VisibleTextUtils.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "Epub/converters/ImageDimsProbe.h"
 #include "Epub/converters/ImageToFramebufferDecoder.h"
-#include "Epub/htmlEntities.h"
 
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
@@ -1071,10 +1071,10 @@ bool ChapterHtmlSlimParser::measureTableColumns(HalFile& file, TableColumnMeasur
 
   size_t scanned = 0;
   while (scanned < MAX_SCAN_BYTES) {
-    const size_t count = file.read(buffer, sizeof(buffer));
-    if (count == 0) return false;
-    scanned += count;
-    for (size_t i = 0; i < count; ++i) {
+    const int count = file.read(buffer, sizeof(buffer));
+    if (count <= 0) return false;
+    scanned += static_cast<size_t>(count);
+    for (int i = 0; i < count; ++i) {
       const char c = buffer[i];
       if (inTag) {
         if (quote) {
@@ -1530,14 +1530,12 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->tableRowCells.reserve(MAX_GRID_TABLE_COLUMNS);
     self->tableBorder = CssBorderSide{};
     self->tableColumnCount = 0;
-    if (self->xmlParser_) {
-      // Rows stream in one at a time, so plan shared column widths from the raw markup first.
-      HalFile tableFile;
+    HalFile tableFile;
+    if (self->xmlParser_ && Storage.openFileForRead("EHP", self->filepath, tableFile)) {
+      const auto xmlOffset = static_cast<size_t>(XML_GetCurrentByteIndex(self->xmlParser_));
+      const auto offset = self->dataUriStripper.rawOffset(xmlOffset, tableFile);
       TableColumnMeasure measure;
-      const auto offset =
-          self->dataUriStripper.rawOffset(static_cast<size_t>(XML_GetCurrentByteIndex(self->xmlParser_)));
-      if (offset && Storage.openFileForRead("EHP", self->filepath, tableFile) && tableFile.seek(*offset) &&
-          self->measureTableColumns(tableFile, measure)) {
+      if (offset && tableFile.seek(*offset) && self->measureTableColumns(tableFile, measure)) {
         self->planTableColumns(measure);
       }
     }
@@ -1622,8 +1620,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                                                            tableCellBlockStyle, self->paragraphIndentSpaces);
     if (!self->currentTextBlock) {
       LOG_ERR("EHP", "OOM: table cell");
-      self->skipUntilDepth = self->depth;
-      self->depth += 1;
+      self->failLayoutOom();
       return;
     }
     for (const CssBorderSide* side :
@@ -1729,7 +1726,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                     extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
                   }
                   cachedImageFile.flush();
-                  cachedImageFile.close();
+                  extractSuccess = cachedImageFile.close() && extractSuccess;
                 }
                 if (extractSuccess) {
                   // Retry to absorb SD-card sync latency on slow cards, and to close
@@ -2598,19 +2595,8 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
 }
 
 void XMLCALL ChapterHtmlSlimParser::defaultHandlerExpand(void* userData, const XML_Char* s, const int len) {
-  // Check if this looks like an entity reference (&...;)
-  if (len >= 3 && s[0] == '&' && s[len - 1] == ';') {
-    const char* utf8Value = lookupHtmlEntity(s, static_cast<size_t>(len));
-    if (utf8Value != nullptr) {
-      // Known entity: expand to its UTF-8 value
-      characterData(userData, utf8Value, strlen(utf8Value));
-      return;
-    }
-    // Unknown entity: preserve original &...; sequence
-    characterData(userData, s, len);
-    return;
-  }
-  // Not an entity we recognize - skip it
+  const auto text = chapterXmlEntityText({s, static_cast<size_t>(len)});
+  if (!text.empty()) characterData(userData, text.data(), static_cast<int>(text.size()));
 }
 
 void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* name) {
@@ -2854,7 +2840,7 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   if (strcmp(name, "body") == 0) {
     self->insideBody = false;
   }
-  if (strcmp(name, "html") == 0) {
+  if (strcmp(name, "html") == 0 && self->depth == 0) {
     self->htmlEnded_ = true;
   }
 }
@@ -2899,6 +2885,9 @@ void ChapterHtmlSlimParser::failLayoutOom() {
 bool ChapterHtmlSlimParser::shouldAbortForLowMemory() {
   auto& memory = freeink::MemoryManager::instance();
   if (memory.ensureFree(16 * 1024) || memory.ensureFree(8 * 1024)) return false;
+
+  renderer.releaseWordWidthCache();
+  if (memory.ensureFree(8 * 1024)) return false;
 
   LOG_ERR("EHP", "Low heap during layout");
   failLayoutOom();

@@ -67,62 +67,6 @@ def patch_decoder(source):
     )
     source = replace(
         source,
-        "            case 0x504c5445: //'PLTE' palette colors\n"
-        "                memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified\n"
-        "                memcpy(pPage->ucPalette, &s[iOffset], iLen);",
-        "            case 0x504c5445: //'PLTE' palette colors\n"
-        "                if (iLen > 768 || (iLen % 3) != 0) {\n"
-        "                    pPage->iError = PNG_DECODE_ERROR;\n"
-        "                    return 1;\n"
-        "                }\n"
-        "                if (iOffset + iLen > iBytesRead) {\n"
-        "                    iFileOffset += (iOffset - iBytesRead);\n"
-        "                    (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);\n"
-        "                    iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, PNG_FILE_BUF_SIZE);\n"
-        "                    if (iBytesRead < iLen) {\n"
-        "                        pPage->iError = PNG_DECODE_ERROR;\n"
-        "                        return 1;\n"
-        "                    }\n"
-        "                    iFileOffset += iBytesRead;\n"
-        "                    iOffset = 0;\n"
-        "                }\n"
-        "                memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified\n"
-        "                memcpy(pPage->ucPalette, &s[iOffset], iLen);",
-    )
-    source = replace(
-        source,
-        "            case 0x74524e53: //'tRNS' transparency info\n"
-        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED) // if palette exists\n"
-        "                {\n"
-        "                    memcpy(&pPage->ucPalette[768], &s[iOffset], iLen);\n"
-        "                    pPage->iHasAlpha = 1;\n"
-        "                }",
-        "            case 0x74524e53: //'tRNS' transparency info\n"
-        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED || iLen == 2 || iLen == 6) {\n"
-        "                    if (pPage->ucPixelType == PNG_PIXEL_INDEXED && iLen > 256) {\n"
-        "                        pPage->iError = PNG_DECODE_ERROR;\n"
-        "                        return 1;\n"
-        "                    }\n"
-        "                    if (iOffset + iLen > iBytesRead) {\n"
-        "                        iFileOffset += (iOffset - iBytesRead);\n"
-        "                        (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);\n"
-        "                        iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, PNG_FILE_BUF_SIZE);\n"
-        "                        if (iBytesRead < iLen) {\n"
-        "                            pPage->iError = PNG_DECODE_ERROR;\n"
-        "                            return 1;\n"
-        "                        }\n"
-        "                        iFileOffset += iBytesRead;\n"
-        "                        iOffset = 0;\n"
-        "                    }\n"
-        "                }\n"
-        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED) // if palette exists\n"
-        "                {\n"
-        "                    memcpy(&pPage->ucPalette[768], &s[iOffset], iLen);\n"
-        "                    pPage->iHasAlpha = 1;\n"
-        "                }",
-    )
-    return replace(
-        source,
         "                        iFileOffset += iBytesRead;\n"
         "                        iOffset = 0;\n"
         "                    } else {",
@@ -138,6 +82,93 @@ def patch_decoder(source):
         "                    } else {",
     )
 
+    return patch_chunk_reads(source)
+
+
+def replace_chunk_prefix(source, case, payload, checks):
+    start = source.index(case) + len(case)
+    end = source.index(payload, start)
+    return source[:start] + checks + source[end:]
+
+
+def patch_chunk_reads(source):
+    source = replace(
+        source,
+        "  if (!handle->fHandle) return 0;\n"
+        "  return fseek((FILE *)handle->fHandle, position, SEEK_SET);",
+        "  if (!handle->fHandle || fseek((FILE *)handle->fHandle, position, SEEK_SET) != 0) return -1;\n"
+        "  return position;",
+    )
+    source = replace(
+        source,
+        "//\n// Decode the PNG file",
+        "PNG_STATIC int PNGReadChunkBytes(PNGIMAGE *pPage, int count, int *offset, int *fileOffset, int *bytesRead)\n"
+        "{\n"
+        "    if (count <= *bytesRead - *offset) return PNG_SUCCESS;\n"
+        "    const int position = *fileOffset - *bytesRead + *offset;\n"
+        "    if ((*pPage->pfnSeek)(&pPage->PNGFile, position) != position) {\n"
+        "        pPage->iError = PNG_DECODE_ERROR;\n"
+        "        return PNG_DECODE_ERROR;\n"
+        "    }\n"
+        "    const int length = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, PNG_FILE_BUF_SIZE);\n"
+        "    if (length < count) {\n"
+        "        pPage->iError = PNG_DECODE_ERROR;\n"
+        "        return PNG_DECODE_ERROR;\n"
+        "    }\n"
+        "    *fileOffset = position + length;\n"
+        "    *bytesRead = length;\n"
+        "    *offset = 0;\n"
+        "    return PNG_SUCCESS;\n"
+        "}\n"
+        "//\n"
+        "// Decode the PNG file",
+    )
+    source = replace(
+        source,
+        "        if (iOffset > iBytesRead-8) { // need to read more data\n"
+        "            iFileOffset += (iOffset - iBytesRead);\n"
+        "            (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);\n"
+        "            iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, PNG_FILE_BUF_SIZE);\n"
+        "            if (iBytesRead < 8) {\n"
+        "                pPage->iError = PNG_DECODE_ERROR;\n"
+        "                return 1;\n"
+        "            }\n"
+        "            iFileOffset += iBytesRead;\n"
+        "            iOffset = 0;\n"
+        "        }",
+        "        if (PNGReadChunkBytes(pPage, 8, &iOffset, &iFileOffset, &iBytesRead) != PNG_SUCCESS)\n"
+        "            return PNG_DECODE_ERROR;",
+    )
+    source = replace_chunk_prefix(
+        source,
+        "            case 0x504c5445: //'PLTE' palette colors\n",
+        "                memset(&pPage->ucPalette[768]",
+        "                if (iLen > 768 || (iLen % 3) != 0) {\n"
+        "                    pPage->iError = PNG_DECODE_ERROR;\n"
+        "                    return PNG_DECODE_ERROR;\n"
+        "                }\n"
+        "                if (PNGReadChunkBytes(pPage, iLen, &iOffset, &iFileOffset, &iBytesRead) != PNG_SUCCESS)\n"
+        "                    return PNG_DECODE_ERROR;\n",
+    )
+    return replace_chunk_prefix(
+        source,
+        "            case 0x74524e53: //'tRNS' transparency info\n",
+        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED) // if palette exists",
+        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED && iLen > 256) {\n"
+        "                    pPage->iError = PNG_DECODE_ERROR;\n"
+        "                    return PNG_DECODE_ERROR;\n"
+        "                }\n"
+        "                if ((pPage->ucPixelType == PNG_PIXEL_INDEXED || iLen == 2 || iLen == 6) &&\n"
+        "                    PNGReadChunkBytes(pPage, iLen, &iOffset, &iFileOffset, &iBytesRead) != PNG_SUCCESS)\n"
+        "                    return PNG_DECODE_ERROR;\n",
+    )
+
+
+PREVIOUS_DECODER_DIGESTS = (
+    "dc2bc69ec54b119f2ac5a85871394b601d7d043d4061db192c3d8b8673409e47",
+    "e4d4448c2ac3db721fb885bc7a55d73f4c61a53932e802f7ed05c320fb48fd27",
+)
+
 
 TARGETS = (
     ("PNGdec.h", patch_header,
@@ -148,7 +179,7 @@ TARGETS = (
      "d9deb1e586738384f2b996acb2fa80219670ba1ef3a5138ed8559ca59837e5c1"),
     ("png.inl", patch_decoder,
      "8008f43fb74e578df3651791da4fb4ac74cb87f946ec6910aeab703fa5b5ea65",
-     "e4d4448c2ac3db721fb885bc7a55d73f4c61a53932e802f7ed05c320fb48fd27"),
+     "50c214f545ce66550ffd86dd143303b92272fce42241f2617058ededf9e113e1"),
 )
 
 
@@ -167,7 +198,9 @@ def apply_patch(dependency_dir):
         digest = hashlib.sha256(contents).hexdigest()
         if digest == patched:
             continue
-        if digest != upstream:
+        if filename == "png.inl" and digest in PREVIOUS_DECODER_DIGESTS:
+            transform = patch_chunk_reads
+        elif digest != upstream:
             raise RuntimeError(f"Unrecognized PNGdec 1.1.6 source: {path}")
         result = transform(contents.decode()).encode()
         if hashlib.sha256(result).hexdigest() != patched:
@@ -177,7 +210,7 @@ def apply_patch(dependency_dir):
     for path, result in updates.items():
         path.write_bytes(result)
     if updates:
-        print("Patched PNGdec scanline storage and IDAT reads")
+        print("Patched PNGdec scanline storage and chunk reads")
 
 
 if "Import" in globals():

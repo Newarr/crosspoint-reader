@@ -2,11 +2,15 @@
 
 #include <Arduino.h>
 #include <Logging.h>
+#ifdef ESP_PLATFORM
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#endif
 
 namespace {
+#ifdef ESP_PLATFORM
 portMUX_TYPE s_abortMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
 ImageToFramebufferDecoder::AbortFn s_abortFn = nullptr;
 void* s_abortCtx = nullptr;
 }  // namespace
@@ -39,32 +43,48 @@ bool ImageToFramebufferDecoder::validateAndStoreDimensions(const int64_t width, 
 }
 
 void ImageToFramebufferDecoder::yieldDuringDecode(uint32_t& lastYieldMs) {
+#ifdef ESP_PLATFORM
   const uint32_t now = millis();
   if (now - lastYieldMs >= 12) {
     lastYieldMs = now;
     vTaskDelay(1);
   }
+#else
+  (void)lastYieldMs;
+#endif
 }
 
 void ImageToFramebufferDecoder::setAbortCheck(void* ctx, AbortFn fn) {
+#ifdef ESP_PLATFORM
   portENTER_CRITICAL(&s_abortMux);
+#endif
   s_abortCtx = ctx;
   s_abortFn = fn;
+#ifdef ESP_PLATFORM
   portEXIT_CRITICAL(&s_abortMux);
+#endif
 }
 
 void ImageToFramebufferDecoder::getAbortCheck(void*& ctx, AbortFn& fn) {
+#ifdef ESP_PLATFORM
   portENTER_CRITICAL(&s_abortMux);
+#endif
   ctx = s_abortCtx;
   fn = s_abortFn;
+#ifdef ESP_PLATFORM
   portEXIT_CRITICAL(&s_abortMux);
+#endif
 }
 
 bool ImageToFramebufferDecoder::isAborted() {
+#ifdef ESP_PLATFORM
   portENTER_CRITICAL(&s_abortMux);
+#endif
   const AbortFn fn = s_abortFn;
   void* const ctx = s_abortCtx;
+#ifdef ESP_PLATFORM
   portEXIT_CRITICAL(&s_abortMux);
+#endif
   return fn != nullptr && fn(ctx);
 }
 

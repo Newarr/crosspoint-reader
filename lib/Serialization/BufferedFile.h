@@ -140,7 +140,9 @@ void writePod(BufferedFileWriter& out, const T& value) {
 
 template <typename T>
 void readPod(BufferedFileReader& in, T& value) {
-  in.read(&value, sizeof(T));
+  if (in.read(&value, sizeof(T)) != sizeof(T)) {
+    value = T{};
+  }
 }
 
 inline void writeString(BufferedFileWriter& out, const std::string& s) {
@@ -150,11 +152,15 @@ inline void writeString(BufferedFileWriter& out, const std::string& s) {
 }
 
 inline void readString(BufferedFileReader& in, std::string& s) {
-  uint32_t len;
-  readPod(in, len);
+  constexpr uint32_t MAX_LEN = 65536;
+  uint32_t len = 0;
+  if (in.read(&len, sizeof(len)) != sizeof(len) || len > MAX_LEN) {
+    s.clear();
+    return;
+  }
   s.resize(len);
-  if (len > 0) {
-    in.read(&s[0], len);
+  if (len > 0 && in.read(&s[0], len) != len) {
+    s.clear();
   }
 }
 

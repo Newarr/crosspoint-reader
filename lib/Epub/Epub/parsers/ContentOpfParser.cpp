@@ -236,7 +236,8 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   if (self->state == IN_PACKAGE && xmlLocalNameEquals(name, "manifest")) {
     self->state = IN_MANIFEST;
     if (self->cache && !Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
+      self->failItemStore();
+      return;
     }
     if (self->tempItemStore) self->itemIndex.reset(new (std::nothrow) ItemIndexEntry[MAX_ITEM_INDEX_ENTRIES]);
     return;
@@ -244,8 +245,10 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && xmlLocalNameEquals(name, "spine")) {
     self->state = IN_SPINE;
-    if (self->cache && !Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+    if (self->cache && (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore) ||
+                        self->tempItemStore.size() != self->itemStoreSize)) {
+      self->failItemStore();
+      return;
     }
 
     if (self->itemIndex && self->itemIndexSize > 0) {
@@ -333,8 +336,14 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
                                                     static_cast<uint32_t>(self->tempItemStore.position())};
         }
       }
-      serialization::writeString(self->tempItemStore, itemId);
-      serialization::writeString(self->tempItemStore, href);
+      if (!serialization::tryWriteString(self->tempItemStore, itemId) ||
+          !serialization::tryWriteString(self->tempItemStore, href)) {
+        self->failItemStore();
+        return;
+      }
+      self->itemStoreSize = self->tempItemStore.position();
+      self->maxItemIdLength = std::max(self->maxItemIdLength, itemId.size());
+      self->maxItemHrefLength = std::max(self->maxItemHrefLength, href.size());
     }
 
     if (itemId == self->coverItemId) {
@@ -388,38 +397,15 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
         if (strcmp(atts[i], "idref") == 0) {
           const std::string idref = atts[i + 1];
           std::string href;
-          bool found = false;
-
-          if (self->useItemIndex) {
-            // Fast path: binary search
-            uint32_t targetHash = fnvHash(idref);
-            uint16_t targetLen = static_cast<uint16_t>(idref.size());
-
-            const auto* begin = self->itemIndex.get();
-            const auto* end = begin + self->itemIndexSize;
-            auto it = std::lower_bound(begin, end, ItemIndexEntry{targetHash, targetLen, 0},
-                                       [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
-                                         return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
-                                       });
-
-            // Check for match (may need to check a few due to hash collisions)
-            while (it != end && it->idHash == targetHash && it->idLen == targetLen) {
-              self->tempItemStore.seek(it->fileOffset);
-              std::string itemId;
-              serialization::readString(self->tempItemStore, itemId);
-              if (itemId == idref) {
-                serialization::readString(self->tempItemStore, href);
-                found = true;
-                break;
-              }
-              ++it;
-            }
-          } else {
-            found = self->findItemHrefSequential(idref, href);
-          }
-
-          if (found && self->cache) {
-            self->cache->createSpineEntry(href);
+          switch (self->findItemHref(idref, href)) {
+            case ItemLookup::Found:
+              self->cache->createSpineEntry(href);
+              break;
+            case ItemLookup::Missing:
+              break;
+            case ItemLookup::IoError:
+              self->failItemStore();
+              return;
           }
         }
       }
@@ -454,26 +440,53 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 }
 
-bool ContentOpfParser::findItemHrefSequential(const std::string& idref, std::string& href) {
-  if (!tempItemStore) return false;
-  const uint32_t startOffset = static_cast<uint32_t>(tempItemStore.position());
+void ContentOpfParser::failItemStore() {
+  LOG_ERR("COF", "Manifest item store I/O failed");
+  XML_StopParser(parser, XML_FALSE);
+}
+
+bool ContentOpfParser::readItemRecord(std::string& id, std::string& href) {
+  return serialization::tryReadString(tempItemStore, id, maxItemIdLength) &&
+         serialization::tryReadString(tempItemStore, href, maxItemHrefLength);
+}
+
+ContentOpfParser::ItemLookup ContentOpfParser::findItemHref(const std::string& idref, std::string& href) {
+  if (!useItemIndex) return findItemHrefSequential(idref, href);
+
+  const uint32_t targetHash = fnvHash(idref);
+  const uint16_t targetLen = static_cast<uint16_t>(idref.size());
+  const auto* begin = itemIndex.get();
+  const auto* end = begin + itemIndexSize;
+  auto it = std::lower_bound(begin, end, ItemIndexEntry{targetHash, targetLen, 0},
+                             [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
+                               return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
+                             });
   std::string itemId;
-  for (int pass = 0; pass < 2; pass++) {
-    if (pass == 1) {
-      if (startOffset == 0) break;
-      if (!tempItemStore.seek(0)) return false;
-    }
-    while (tempItemStore.available() && (pass == 0 || static_cast<uint32_t>(tempItemStore.position()) < startOffset)) {
-      const auto recordOffset = tempItemStore.position();
-      serialization::readString(tempItemStore, itemId);
-      serialization::readString(tempItemStore, href);
-      if (tempItemStore.position() <= recordOffset) break;
-      if (itemId == idref) return true;
-    }
+  for (; it != end && it->idHash == targetHash && it->idLen == targetLen; ++it) {
+    if (!tempItemStore.seek(it->fileOffset) || !readItemRecord(itemId, href)) return ItemLookup::IoError;
+    if (itemId == idref) return ItemLookup::Found;
   }
-  href.clear();
-  tempItemStore.seek(startOffset);
-  return false;
+  return ItemLookup::Missing;
+}
+
+ContentOpfParser::ItemLookup ContentOpfParser::findItemHrefSequential(const std::string& idref, std::string& href) {
+  if (!tempItemStore) return ItemLookup::IoError;
+  const auto startOffset = tempItemStore.position();
+  const auto endOffset = tempItemStore.size();
+  if (startOffset > endOffset) return ItemLookup::IoError;
+
+  std::string itemId;
+  for (int pass = 0; pass < 2; ++pass) {
+    const auto limit = pass == 0 ? endOffset : startOffset;
+    while (tempItemStore.position() < limit) {
+      if (!readItemRecord(itemId, href) || tempItemStore.position() > limit) return ItemLookup::IoError;
+      if (itemId == idref) return ItemLookup::Found;
+    }
+    if (startOffset == 0 || pass != 0) break;
+    if (!tempItemStore.seek(0)) return ItemLookup::IoError;
+  }
+  if (!tempItemStore.seek(startOffset)) return ItemLookup::IoError;
+  return ItemLookup::Missing;
 }
 
 void XMLCALL ContentOpfParser::characterData(void* userData, const XML_Char* s, const int len) {
@@ -531,7 +544,7 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_MANIFEST && xmlLocalNameEquals(name, "manifest")) {
     self->state = IN_PACKAGE;
-    if (self->tempItemStore) self->tempItemStore.close();
+    if (self->tempItemStore && !self->tempItemStore.close()) self->failItemStore();
     return;
   }
 

@@ -11,7 +11,6 @@
 
 #include "HapticFeedback.h"
 #include "MappedInputManager.h"
-#include "TurnNetting.h"
 #include "activities/ActivityManager.h"
 
 namespace ReaderUtils {
@@ -69,50 +68,6 @@ inline FrontPageTurnButtons getFrontPageTurnButtons(const MappedInputManager& in
           swapped ? MappedInputManager::Button::Left : MappedInputManager::Button::Right};
 }
 
-struct PageTurnResult {
-  bool prev;
-  bool next;
-  bool fromTilt;
-};
-
-inline turnnet::TriggerCounts countPageTurnTriggers(const MappedInputManager& input, bool& fromTilt) {
-  using Button = MappedInputManager::Button;
-  const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;
-  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
-  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
-  fromTilt = tiltPrev || tiltNext;
-  const auto frontButtons = getFrontPageTurnButtons(input);
-  const auto count = [&](const Button button) -> int {
-    if (usePress) return input.wasPressedCount(button);
-    if (input.wasLongPressed(button, SKIP_HOLD_MS)) return 1;
-    return input.wasReleasedCount(button);
-  };
-  const bool powerTurn =
-      SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN && input.wasPowerSingleClick();
-  const bool homeTurn = input.homeButtonAction() == HomeButtonAction::NextPage;
-  return {count(Button::PageForward) + count(frontButtons.next) + tiltNext + (powerTurn || homeTurn),
-          count(Button::PageBack) + count(frontButtons.previous) + tiltPrev};
-}
-
-inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
-  const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;
-  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
-  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
-  const auto frontButtons = getFrontPageTurnButtons(input);
-  const auto pageButtonTriggered = [&](const MappedInputManager::Button button) {
-    if (usePress) return input.wasPressed(button);
-    return input.wasLongPressed(button, SKIP_HOLD_MS) || input.wasReleased(button);
-  };
-  const bool prev = tiltPrev || (pageButtonTriggered(MappedInputManager::Button::PageBack) ||
-                                 pageButtonTriggered(frontButtons.previous));
-  const bool powerTurn =
-      SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN && input.wasPowerSingleClick();
-  const bool next = input.homeButtonAction() == HomeButtonAction::NextPage || tiltNext ||
-                    pageButtonTriggered(MappedInputManager::Button::PageForward) || powerTurn ||
-                    pageButtonTriggered(frontButtons.next);
-  return {prev, next, tiltPrev || tiltNext};
-}
-
 struct TouchPageTurn {
   bool prev;
   bool next;
@@ -166,6 +121,62 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
   result.prev = prevTaps && (!nextTaps || !nextZone);
   result.heldMs = gpio.lastTouchHeldMs();
   return result;
+}
+
+struct PageTurnResult {
+  int forwardCount;
+  int backCount;
+  int holdDirection;
+  bool holdFromTouch;
+};
+
+inline bool isOnlyPhysicalRelease() {
+  unsigned int releaseCount = 0;
+  for (uint8_t button = HalGPIO::BTN_BACK; button <= HalGPIO::BTN_POWER; ++button) {
+    releaseCount += gpio.wasReleasedCount(button);
+  }
+  return releaseCount == 1;
+}
+
+inline PageTurnResult detectPageTurn(const MappedInputManager& input, const TouchPageTurn& touch) {
+  using Button = MappedInputManager::Button;
+  const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;
+  const auto frontButtons = getFrontPageTurnButtons(input);
+  const auto count = [&](const Button button) {
+    return usePress ? input.wasPressedCount(button) : input.wasReleasedCount(button);
+  };
+
+  int holdDirection = 0;
+  if (!usePress) {
+    if (input.wasLongPressed(Button::PageBack, SKIP_HOLD_MS) ||
+        input.wasLongPressed(frontButtons.previous, SKIP_HOLD_MS)) {
+      holdDirection = -1;
+    } else if (input.wasLongPressed(Button::PageForward, SKIP_HOLD_MS) ||
+               input.wasLongPressed(frontButtons.next, SKIP_HOLD_MS)) {
+      holdDirection = 1;
+    }
+  }
+  int forwardButtons = count(Button::PageForward) + count(frontButtons.next);
+  int backButtons = count(Button::PageBack) + count(frontButtons.previous);
+  if (!usePress && holdDirection == 0 && forwardButtons + backButtons == 1 && !input.hasRemoteClick() &&
+      gpio.wasAnyReleased() && input.getHeldTime() >= SKIP_HOLD_MS && isOnlyPhysicalRelease() &&
+      !gpio.rawInputActive()) {
+    holdDirection = forwardButtons == 1 ? 1 : -1;
+    forwardButtons = 0;
+    backButtons = 0;
+  }
+
+  const bool touchHold = !usePress && (touch.prev || touch.next) && touch.heldMs >= SKIP_HOLD_MS;
+  const bool holdFromTouch = holdDirection == 0 && touchHold;
+  if (holdFromTouch) holdDirection = touch.prev ? -1 : 1;
+
+  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
+  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
+  const bool powerTurn =
+      SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN && input.wasPowerSingleClick();
+  const bool homeTurn = input.homeButtonAction() == HomeButtonAction::NextPage;
+  return {forwardButtons + tiltNext + (powerTurn || homeTurn) + (touch.next && !touchHold),
+          backButtons + tiltPrev + (touch.prev && !touchHold), holdDirection, holdFromTouch};
 }
 
 // Tap in the center third of the screen: the tap path into the reader menu on

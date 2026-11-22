@@ -23,6 +23,8 @@ class HalStorage {
  public:
   HalStorage();
   bool begin();
+  bool reinit();
+  bool isCardResponsive();
   // Stop the SD card for deep sleep: unmount, stop the SDMMC host, and release
   // the bus pads (no-op on SPI boards). Call only after all file users have
   // stopped; open HalFiles become invalid. A deep-sleep wake resets the MCU and

@@ -17,25 +17,18 @@ namespace fui = freeink::ui;
 void MappedInputManager::update(const bool deferHomeButtonAction) const {
   remoteInput.reset();
   gpio.update();
-  const bool powerHeld = gpio.isPressed(HalGPIO::BTN_POWER);
-  const bool powerReleased = gpio.wasReleased(HalGPIO::BTN_POWER);
-  const bool sharedConfirmRelease =
-      BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::DigitalConfirmPowerHold &&
-      gpio.wasReleased(HalGPIO::BTN_CONFIRM);
-  // Shared keys are physically held before the SDK emits logical Power.
-  powerButtonInput.update(isPowerHeld(), powerReleased || sharedConfirmRelease,
-                          (powerHeld || powerReleased) ? gpio.getPowerButtonHeldTime() : 0,
-                          SETTINGS.getPowerButtonDuration());
+  const uint32_t now = millis();
+  updateButtonHolds(now);
   const bool pagePressed =
       SETTINGS.vibration == CrossPointSettings::VIBRATION_TOUCH_PAGE && gpio.wasCapacitivePagePressed();
   HalHaptics::feedback(SETTINGS.vibration != CrossPointSettings::VIBRATION_OFF, pagePressed, SETTINGS.hapticIntensity);
   homeAction = HomeButtonAction::Ignore;
   if (gpio.hasHomeKey()) {
-    homeAction = homeButtonInput.update(millis(), gpio.wasHomeKeyTapped(), gpio.wasHomeKeyLongPressed(),
-                                        wasSwipe() != SwipeDir::None, gpio.wasHomeKeyPressed(),
-                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonTapAction),
-                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonDoubleTapAction),
-                                        static_cast<HomeButtonAction>(SETTINGS.homeButtonLongPressAction));
+    homeAction =
+        homeButtonInput.update(now, gpio.wasHomeKeyTapped(), gpio.wasHomeKeyLongPressed(), wasSwipe() != SwipeDir::None,
+                               gpio.wasHomeKeyPressed(), static_cast<HomeButtonAction>(SETTINGS.homeButtonTapAction),
+                               static_cast<HomeButtonAction>(SETTINGS.homeButtonDoubleTapAction),
+                               static_cast<HomeButtonAction>(SETTINGS.homeButtonLongPressAction));
     if (gpio.wasHomeKeyLongPressed() && homeAction != HomeButtonAction::Ignore) {
       HalHaptics::longPress(SETTINGS.vibration != CrossPointSettings::VIBRATION_OFF, SETTINGS.hapticIntensity);
     } else if (homeAction != HomeButtonAction::Ignore) {
@@ -44,53 +37,8 @@ void MappedInputManager::update(const bool deferHomeButtonAction) const {
   }
   powerSleepFrame = false;
   powerSingleClickFrame = false;
-  const bool classifyPower =
-      CrossPointSettings::hasPowerDoubleClick() && SETTINGS.doublePwrBtn != CrossPointSettings::IGNORE;
-  if (classifyPower && !gpio.isPressed(HalGPIO::BTN_DOWN) && !powerButtonInput.suppressesHold() &&
-      !wasPowerReleaseConsumed()) {
-    const auto click = powerButtonClickInput.update(millis(), gpio.isPressed(HalGPIO::BTN_POWER),
-                                                    wasShortPowerReleased(), gpio.getPowerButtonHeldTime());
-    powerSingleClickFrame = click == PowerButtonClickInput::Click::Single;
-    if (click != PowerButtonClickInput::Click::None) {
-      const auto action = click == PowerButtonClickInput::Click::Double ? SETTINGS.doublePwrBtn : SETTINGS.shortPwrBtn;
-      switch (action) {
-        case CrossPointSettings::IGNORE:
-          break;
-        case CrossPointSettings::SLEEP:
-          powerSleepFrame = true;
-          break;
-        case CrossPointSettings::PAGE_TURN:
-          homeAction = HomeButtonAction::NextPage;
-          break;
-        case CrossPointSettings::FORCE_REFRESH:
-          homeAction = HomeButtonAction::Refresh;
-          break;
-        case CrossPointSettings::FOOTNOTES:
-          homeAction = HomeButtonAction::Footnotes;
-          break;
-        case CrossPointSettings::PWR_CONFIRM:
-          homeAction = HomeButtonAction::Confirm;
-          break;
-        case CrossPointSettings::CREATE_CLIPPING:
-          homeAction = HomeButtonAction::CreateClipping;
-          break;
-        case CrossPointSettings::PWR_BOOKMARK:
-          homeAction = HomeButtonAction::Bookmark;
-          break;
-        case CrossPointSettings::PWR_SYNC:
-          homeAction = HomeButtonAction::Sync;
-          break;
-        case CrossPointSettings::PWR_READER_MENU:
-          homeAction = HomeButtonAction::ReaderMenu;
-          break;
-        case CrossPointSettings::PWR_FRONTLIGHT:
-          homeAction = HomeButtonAction::ToggleFrontlight;
-          break;
-      }
-    }
-  } else {
-    powerButtonClickInput.reset();
-  }
+  const bool classifyPower = classifiesPowerClicks();
+  updatePowerInput(now, classifyPower);
   // Touch boards without a home key: a short power click can carry a reader
   // shortcut (see SHORT_PWRBTN).
   if (!classifyPower && homeAction == HomeButtonAction::Ignore && wasShortPowerReleased()) {
@@ -124,9 +72,159 @@ void MappedInputManager::update(const bool deferHomeButtonAction) const {
     homeAction = deferredHomeAction;
     deferredHomeAction = HomeButtonAction::Ignore;
   }
-  for (uint8_t value = 0; value <= static_cast<uint8_t>(Button::ScreenDown); ++value) {
-    if (!isPressed(static_cast<Button>(value))) longPressFiredButtons &= ~(1u << value);
+}
+
+bool MappedInputManager::classifiesPowerClicks() const {
+  return CrossPointSettings::hasPowerDoubleClick() && SETTINGS.doublePwrBtn != CrossPointSettings::IGNORE;
+}
+
+void MappedInputManager::beginPowerInput(bool suppressHold, bool held) {
+  powerButtonInput.begin(suppressHold, held);
+  powerPressTracked = held;
+  powerPressedAt = millis() - gpio.getPowerButtonHeldTime();
+  shortPowerReleaseFrame = powerHoldSleepFrame = false;
+  consumedPowerReleases = 0;
+  consumedSharedConfirmClick = false;
+  resetPowerButtonInput();
+}
+
+void MappedInputManager::updatePowerInput(uint32_t now, bool classifyClicks) const {
+  consumedPowerReleases = 0;
+  consumedSharedConfirmClick = false;
+  shortPowerReleaseFrame = powerHoldSleepFrame = false;
+  const bool allowClicks = classifyClicks && !gpio.isPressed(HalGPIO::BTN_DOWN);
+  const bool waitForDoubleClick = classifyClicks && SETTINGS.shortPwrBtn == CrossPointSettings::SLEEP;
+  const uint16_t sleepThreshold = SETTINGS.getPowerButtonDuration();
+  const auto samplePower = [&](uint32_t time, bool held, bool powerReleased, uint32_t heldMs,
+                               bool sharedConfirmRelease = false) {
+    const bool released = powerReleased || sharedConfirmRelease;
+    powerButtonInput.update(held || (!released && isPowerHeld()), released, heldMs, sleepThreshold);
+    const bool shortRelease = powerReleased && powerButtonInput.wasShortReleased();
+    const bool consumed = powerButtonInput.wasReleaseConsumed();
+    if (powerReleased && consumed) ++consumedPowerReleases;
+    if (sharedConfirmRelease && consumed) consumedSharedConfirmClick = true;
+    shortPowerReleaseFrame |= shortRelease;
+    if (!waitForDoubleClick || heldMs > PowerButtonClickInput::MAX_CLICK_HOLD_MS) {
+      powerHoldSleepFrame |= powerButtonInput.shouldSleep();
+    }
+    if (!allowClicks || powerButtonInput.suppressesHold() || consumed) {
+      powerButtonClickInput.reset();
+      return;
+    }
+    applyPowerClick(powerButtonClickInput.update(time, held, shortRelease, heldMs));
+  };
+
+  const bool powerHeld = gpio.isPressed(HalGPIO::BTN_POWER);
+  if (!gpio.deviceIsX3()) {
+    const bool powerReleased = gpio.wasReleased(HalGPIO::BTN_POWER);
+    const bool sharedConfirmRelease =
+        BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::DigitalConfirmPowerHold &&
+        gpio.wasReleased(HalGPIO::BTN_CONFIRM);
+    const uint32_t heldMs = (powerHeld || powerReleased) ? gpio.getPowerButtonHeldTime() : 0;
+    samplePower(now, powerHeld, powerReleased, heldMs, sharedConfirmRelease);
+    return;
   }
+
+  if (gpio.frameTransitionsOverflowed()) {
+    powerButtonInput.begin(true, isPowerHeld());
+    powerPressTracked = false;
+    consumedPowerReleases = gpio.wasReleasedCount(HalGPIO::BTN_POWER);
+    powerButtonClickInput.reset();
+    return;
+  }
+
+  for (uint8_t index = 0; index < gpio.frameTransitionCount(); ++index) {
+    const auto transition = gpio.frameTransition(index);
+    if (transition.button != HalGPIO::BTN_POWER) continue;
+    if (transition.pressed) {
+      powerPressedAt = transition.timestampMs;
+      powerPressTracked = true;
+      samplePower(transition.timestampMs, true, false, 0);
+    } else {
+      const uint32_t heldMs =
+          powerPressTracked ? transition.timestampMs - powerPressedAt : gpio.getPowerButtonHeldTime();
+      samplePower(transition.timestampMs, false, true, heldMs);
+      powerPressTracked = false;
+    }
+  }
+
+  if (powerHeld && !powerPressTracked) {
+    powerPressedAt = now - gpio.getPowerButtonHeldTime();
+    powerPressTracked = true;
+  }
+  samplePower(now, powerHeld, false, powerHeld ? now - powerPressedAt : 0);
+}
+
+void MappedInputManager::applyPowerClick(PowerButtonClickInput::Click click) const {
+  if (click == PowerButtonClickInput::Click::None) return;
+  powerSingleClickFrame |= click == PowerButtonClickInput::Click::Single;
+  const auto action = click == PowerButtonClickInput::Click::Double ? SETTINGS.doublePwrBtn : SETTINGS.shortPwrBtn;
+  switch (action) {
+    case CrossPointSettings::IGNORE:
+      break;
+    case CrossPointSettings::SLEEP:
+      powerSleepFrame = true;
+      break;
+    case CrossPointSettings::PAGE_TURN:
+      homeAction = HomeButtonAction::NextPage;
+      break;
+    case CrossPointSettings::FORCE_REFRESH:
+      homeAction = HomeButtonAction::Refresh;
+      break;
+    case CrossPointSettings::FOOTNOTES:
+      homeAction = HomeButtonAction::Footnotes;
+      break;
+    case CrossPointSettings::PWR_CONFIRM:
+      homeAction = HomeButtonAction::Confirm;
+      break;
+    case CrossPointSettings::CREATE_CLIPPING:
+      homeAction = HomeButtonAction::CreateClipping;
+      break;
+    case CrossPointSettings::PWR_BOOKMARK:
+      homeAction = HomeButtonAction::Bookmark;
+      break;
+    case CrossPointSettings::PWR_SYNC:
+      homeAction = HomeButtonAction::Sync;
+      break;
+    case CrossPointSettings::PWR_READER_MENU:
+      homeAction = HomeButtonAction::ReaderMenu;
+      break;
+    case CrossPointSettings::PWR_FRONTLIGHT:
+      homeAction = HomeButtonAction::ToggleFrontlight;
+      break;
+  }
+}
+
+void MappedInputManager::updateButtonHolds(uint32_t now) const {
+  const bool overflowed = gpio.frameTransitionsOverflowed();
+  for (uint8_t index = 0; index < gpio.frameTransitionCount(); ++index) {
+    const auto transition = gpio.frameTransition(index);
+    if (transition.button > HalGPIO::BTN_POWER) continue;
+    const uint8_t bit = 1u << transition.button;
+    if (transition.pressed) {
+      pressedAt[transition.button] = transition.timestampMs;
+      heldButtons |= bit;
+    } else {
+      heldButtons &= ~bit;
+    }
+  }
+
+  suppressedReleasesThisFrame = 0;
+  for (uint8_t button = HalGPIO::BTN_BACK; button <= HalGPIO::BTN_POWER; ++button) {
+    const uint8_t bit = 1u << button;
+    if (gpio.wasReleasedCount(button)) {
+      longPressFiredButtons &= ~bit;
+      suppressedReleasesThisFrame |= suppressedReleaseButtons & bit;
+    }
+    if (!gpio.isPressed(button)) {
+      heldButtons &= ~bit;
+      longPressFiredButtons &= ~bit;
+    } else if (!(heldButtons & bit) || overflowed) {
+      pressedAt[button] = now;
+      heldButtons |= bit;
+    }
+  }
+  suppressedReleaseButtons &= ~suppressedReleasesThisFrame;
 }
 
 bool MappedInputManager::isNavDirectionSwapped() const {
@@ -462,64 +560,45 @@ bool MappedInputManager::injectRemoteClick(const RemoteButton button) {
   return remoteInput.click(button);
 }
 
-bool MappedInputManager::wasPressed(const Button button) const {
-  if (button == Button::Confirm && remoteInput.button == RemoteButton::Confirm) return true;
-  if (button == Button::Back && remoteInput.button == RemoteButton::Back) return true;
-  if ((button == Button::NavNext || button == Button::Right) && remoteInput.button == RemoteButton::Next) return true;
-  if ((button == Button::NavPrevious || button == Button::Left) && remoteInput.button == RemoteButton::Previous)
-    return true;
-  if (button == Button::Confirm && homeAction == HomeButtonAction::Confirm) return true;
-  if (button == Button::Back && wasBackGesture()) return true;
+bool MappedInputManager::hasSyntheticClick(const Button button) const {
+  switch (button) {
+    case Button::Confirm:
 #if FREEINK_CAP_TOUCH
-  if (button == Button::Confirm && wasPowerConfirmClick()) return true;
+      if (wasPowerConfirmClick()) return true;
 #endif
-  return mapButton(button, &HalGPIO::wasPressed);
+      return remoteInput.button == RemoteButton::Confirm || homeAction == HomeButtonAction::Confirm;
+    case Button::Back:
+      return remoteInput.button == RemoteButton::Back || wasBackGesture();
+    case Button::NavNext:
+    case Button::Right:
+      return remoteInput.button == RemoteButton::Next;
+    case Button::NavPrevious:
+    case Button::Left:
+      return remoteInput.button == RemoteButton::Previous;
+    default:
+      return false;
+  }
 }
 
-bool MappedInputManager::wasReleased(const Button button) const {
-  if (button == Button::Power && CrossPointSettings::hasPowerDoubleClick() &&
-      SETTINGS.doublePwrBtn != CrossPointSettings::IGNORE) {
-    return false;  // Classified clicks are dispatched once through homeAction.
-  }
-  if (button == Button::Confirm && remoteInput.button == RemoteButton::Confirm) return true;
-  if (button == Button::Back && remoteInput.button == RemoteButton::Back) return true;
-  if ((button == Button::NavNext || button == Button::Right) && remoteInput.button == RemoteButton::Next) return true;
-  if ((button == Button::NavPrevious || button == Button::Left) && remoteInput.button == RemoteButton::Previous)
-    return true;
-  if (button == Button::Confirm && homeAction == HomeButtonAction::Confirm) return true;
-  if (button == Button::Back && wasBackGesture()) return true;
-#if FREEINK_CAP_TOUCH
-  if (button == Button::Confirm && wasPowerConfirmClick()) return true;
-#endif
-  return mapButton(button, &HalGPIO::wasReleased);
-}
+bool MappedInputManager::wasPressed(const Button button) const { return wasPressedCount(button) != 0; }
+
+bool MappedInputManager::wasReleased(const Button button) const { return wasReleasedCount(button) != 0; }
 
 bool MappedInputManager::wasLongPressed(const Button button, const unsigned long thresholdMs) const {
-  if (!isPressed(button)) return false;
-  const uint16_t bit = 1u << static_cast<uint8_t>(button);
-  if ((longPressFiredButtons & bit) != 0 || getHeldTime() < thresholdMs) return false;
-  longPressFiredButtons |= bit;
-  suppressNextRelease(button);
-  if (mapButton(button, &HalGPIO::isCapacitivePagePressed)) {
-    HalHaptics::longPress(SETTINGS.vibration == CrossPointSettings::VIBRATION_TOUCH_PAGE, SETTINGS.hapticIntensity);
-  }
-  return true;
-}
-
-void MappedInputManager::suppressNextRelease(const Button button) const {
-  suppressedReleaseButtons |= 1u << static_cast<uint8_t>(button);
-}
-
-bool MappedInputManager::consumeSuppressedRelease() const {
-  uint16_t released = 0;
-  for (uint8_t value = 0; value <= static_cast<uint8_t>(Button::ScreenDown); ++value) {
-    const uint16_t bit = 1u << value;
-    if ((suppressedReleaseButtons & bit) != 0 && mapButton(static_cast<Button>(value), &HalGPIO::wasReleased)) {
-      released |= bit;
+  if (hasRemoteClick() || homeAction != HomeButtonAction::Ignore) return false;
+  const uint8_t candidates = physicalButtons(button) & heldButtons & ~longPressFiredButtons;
+  const uint32_t now = millis();
+  for (uint8_t index = HalGPIO::BTN_BACK; index <= HalGPIO::BTN_POWER; ++index) {
+    const uint8_t bit = 1u << index;
+    if (!(candidates & bit) || now - pressedAt[index] < thresholdMs) continue;
+    longPressFiredButtons |= bit;
+    suppressedReleaseButtons |= bit;
+    if (gpio.isCapacitivePagePressed(index)) {
+      HalHaptics::longPress(SETTINGS.vibration == CrossPointSettings::VIBRATION_TOUCH_PAGE, SETTINGS.hapticIntensity);
     }
+    return true;
   }
-  suppressedReleaseButtons &= ~released;
-  return released != 0;
+  return false;
 }
 
 bool MappedInputManager::isPressed(const Button button) const { return mapButton(button, &HalGPIO::isPressed); }
@@ -599,25 +678,26 @@ int MappedInputManager::getPressedFrontButton() const {
   return -1;
 }
 
-uint8_t MappedInputManager::countButtonEdges(const Button button, uint8_t (HalGPIO::*count)(uint8_t) const) const {
+uint8_t MappedInputManager::countButtonEdges(const Button button, bool released) const {
+  if (released && button == Button::Power && classifiesPowerClicks()) return 0;
+
   const uint8_t buttons = physicalButtons(button);
   unsigned int total = 0;
   for (uint8_t index = HalGPIO::BTN_BACK; index <= HalGPIO::BTN_POWER; ++index) {
-    if (buttons & (1u << index)) total += (gpio.*count)(index);
+    const uint8_t bit = 1u << index;
+    if (!(buttons & bit) || (index == HalGPIO::BTN_CONFIRM && consumedSharedConfirmClick)) continue;
+    if (!released) {
+      total += gpio.wasPressedCount(index);
+      continue;
+    }
+    const int count = gpio.wasReleasedCount(index);
+    const int consumedByPower = index == HalGPIO::BTN_POWER ? consumedPowerReleases : 0;
+    const int suppressed = std::max(consumedByPower, (suppressedReleasesThisFrame & bit) ? 1 : 0);
+    total += std::max(0, count - suppressed);
   }
-  return std::min(total, 255u);
+  return total ? std::min(total, 255u) : hasSyntheticClick(button);
 }
 
-uint8_t MappedInputManager::wasPressedCount(const Button button) const {
-  const uint8_t count = countButtonEdges(button, &HalGPIO::wasPressedCount);
-  return count ? count : wasPressed(button);
-}
+uint8_t MappedInputManager::wasPressedCount(const Button button) const { return countButtonEdges(button, false); }
 
-uint8_t MappedInputManager::wasReleasedCount(const Button button) const {
-  if (button == Button::Power && CrossPointSettings::hasPowerDoubleClick() &&
-      SETTINGS.doublePwrBtn != CrossPointSettings::IGNORE) {
-    return 0;
-  }
-  const uint8_t count = countButtonEdges(button, &HalGPIO::wasReleasedCount);
-  return count ? count : wasReleased(button);
-}
+uint8_t MappedInputManager::wasReleasedCount(const Button button) const { return countButtonEdges(button, true); }

@@ -125,7 +125,7 @@ void HalGPIO::begin() {
 #endif
 }
 
-bool HalGPIO::beginAsync(uint32_t pollIntervalMs) { return inputMgr.beginAsync(pollIntervalMs); }
+bool HalGPIO::beginAsync(uint32_t pollIntervalMs) { return inputMgr.beginAsyncFrame(pollIntervalMs); }
 
 void HalGPIO::update() {
   inputMgr.update();
@@ -164,24 +164,13 @@ uint32_t HalGPIO::pressSequence() const { return inputMgr.pressSequence(); }
 
 bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
-bool HalGPIO::rawInputActive() {
-  if (inputMgr.isAsyncActive()) return inputMgr.rawContactActive();
-  if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
-#if FREEINK_DEVICE_LILYGO
-  if (BoardConfig::ACTIVE.board == BoardConfig::Board::LilyGoT5S3 && BoardT5S3::readButton()) return true;
-#endif
-  const int8_t pins[] = {BoardConfig::ACTIVE.input.back, BoardConfig::ACTIVE.input.confirm,
-                         BoardConfig::ACTIVE.input.left, BoardConfig::ACTIVE.input.right,
-                         BoardConfig::ACTIVE.input.up,   BoardConfig::ACTIVE.input.down};
-  for (const int8_t pin : pins) {
-    if (pin >= 0 && digitalRead(pin) == LOW) return true;
-  }
-  InputManager::ButtonAdcSample g1{}, g2{};
-  inputMgr.readButtonAdc(g1, g2);
-  // The Xteink ladder idles at the ADC full-scale rail (~4095); every button band sits below 3900.
-  constexpr int kIdleRailMin = 4000;
-  return (g1.raw >= 0 && g1.raw < kIdleRailMin) || (g2.raw >= 0 && g2.raw < kIdleRailMin);
-}
+bool HalGPIO::rawInputActive() { return inputMgr.rawInputActive(); }
+
+uint8_t HalGPIO::frameTransitionCount() const { return inputMgr.frameTransitionCount(); }
+
+HalGPIO::ButtonTransition HalGPIO::frameTransition(uint8_t index) const { return inputMgr.frameTransition(index); }
+
+bool HalGPIO::frameTransitionsOverflowed() const { return inputMgr.frameTransitionsOverflowed(); }
 
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
 

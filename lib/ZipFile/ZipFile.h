@@ -8,7 +8,7 @@
 
 class ZipFile {
  public:
-  enum class StreamResult : uint8_t { Ok, Aborted, Error };
+  enum class StreamResult : uint8_t { Ok, OutOfMemory, IoError, NotFound };
 
   struct FileStatSlim {
     uint16_t method;             // Compression method
@@ -43,7 +43,7 @@ class ZipFile {
  private:
   const std::string& filePath;
   HalFile file;
-  ZipDetails zipDetails = {0, 0, false};
+  ZipDetails zipDetails = {};
   std::unordered_map<std::string, FileStatSlim> fileStatSlimCache;
 
   // Cursor for sequential central-dir scanning optimization
@@ -55,11 +55,9 @@ class ZipFile {
   FileStatSlim lastLookup = {};
   bool lastLookupValid = false;
 
-  bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
+  StreamResult loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
-  bool loadZipDetails();
-  StreamResult streamFile(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop,
-                          bool (*shouldAbort)());
+  StreamResult loadZipDetails();
 
  public:
   explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
@@ -83,8 +81,7 @@ class ZipFile {
   // that only need the first bytes of an entry.
   bool readFileToStream(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop = false);
 
-  StreamResult readFileToStreamDetailed(const char* filename, Print& out, size_t chunkSize = 1024,
-                                        bool (*shouldAbort)() = nullptr);
+  StreamResult streamFile(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop = false);
 
   template <typename F>
   bool enumerateFilePaths(F&& callback) {
@@ -108,7 +105,7 @@ class ZipFile {
       return false;
     }
 
-    if (!loadZipDetails()) {
+    if (loadZipDetails() != StreamResult::Ok) {
       if (!wasOpen) {
         close();
       }

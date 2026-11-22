@@ -11,6 +11,7 @@
 
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -155,15 +156,19 @@ const uint8_t* mapVerified(const uint32_t slot, const uint32_t key, const uint32
   return data;
 }
 
-// `chunk` holds kCopyChunk bytes.
-bool copyIn(const uint32_t slot, const uint32_t length, const Reader read, void* ctx, uint8_t* chunk) {
-  if (!backend::erase(slotOffset(slot), kSlotSize)) return false;
-  for (uint32_t done = 0; done < length;) {
-    const uint32_t n = length - done < kCopyChunk ? length - done : kCopyChunk;
-    if (!read(ctx, done, chunk, n) || !backend::write(slotOffset(slot) + done, chunk, n)) return false;
-    done += n;
+enum class CopyResult { Ok, SourceError, FlashError };
+
+CopyResult copyIn(const uint32_t slot, const uint32_t length, const Reader read, void* ctx, uint8_t* chunk) {
+  const uint32_t destination = slotOffset(slot);
+  uint32_t offset = 0;
+  while (offset < length) {
+    const uint32_t bytes = std::min(kCopyChunk, length - offset);
+    if (!read(ctx, offset, chunk, bytes)) return CopyResult::SourceError;
+    if (offset == 0 && !backend::erase(destination, kSlotSize)) return CopyResult::FlashError;
+    if (!backend::write(destination + offset, chunk, bytes)) return CopyResult::FlashError;
+    offset += bytes;
   }
-  return true;
+  return CopyResult::Ok;
 }
 
 }  // namespace
@@ -202,11 +207,16 @@ const uint8_t* acquire(const uint32_t key, const uint32_t length, const Reader r
   }
   const auto slot = static_cast<uint32_t>(victim);
   LOG_DBG("FBC", "Copying %u-byte layout font to flash slot %u", length, slot);
-  if (!copyIn(slot, length, read, ctx, chunk.get())) {
-    // Not retried this session: every attempt erases a slot first.
-    LOG_ERR("FBC", "Flash copy to slot %u failed", slot);
-    rememberRejected(key);
-    return nullptr;
+  switch (copyIn(slot, length, read, ctx, chunk.get())) {
+    case CopyResult::Ok:
+      break;
+    case CopyResult::SourceError:
+      LOG_ERR("FBC", "Source read for flash slot %u failed", slot);
+      return nullptr;
+    case CopyResult::FlashError:
+      LOG_ERR("FBC", "Flash copy to slot %u failed", slot);
+      rememberRejected(key);
+      return nullptr;
   }
   const uint8_t* data = mapVerified(slot, key, length);
   if (data == nullptr) {
@@ -214,8 +224,7 @@ const uint8_t* acquire(const uint32_t key, const uint32_t length, const Reader r
     rememberRejected(key);
     return nullptr;
   }
-  // The entry is recorded only after the data verified, so an interrupted
-  // copy leaves the slot unlisted and it is simply rewritten next time.
+  // Until verification succeeds, the old directory entry still needs its content hash to match.
   dir[slot] = DirEntry{kMagic, key, length, newest + 1};
   if (!backend::erase(0, kDirSector) || !backend::write(0, dir, sizeof(dir))) {
     LOG_ERR("FBC", "Flash directory update failed");

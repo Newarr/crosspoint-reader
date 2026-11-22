@@ -1,5 +1,5 @@
 """
-Apply the pinned AnimatedGIF width guard and bounded-copy/palette fixes.
+Apply the pinned AnimatedGIF width, scanline, palette, and cancellation fixes.
 """
 
 import argparse
@@ -79,6 +79,21 @@ COPY_NEW = """#ifdef ALLOWS_UNALIGNED
             }
 """
 
+DRAW_END = "} GIFDRAW;"
+DRAW_END_WITH_ABORT = "    uint8_t ucAbort;\n" + DRAW_END
+
+DRAW_HELPER = """static int GIFDrawLine(GIFIMAGE *pPage, GIFDRAW *pDraw)
+{
+    pDraw->ucAbort = 0;
+    (*pPage->pfnDraw)(pDraw);
+    if (pDraw->ucAbort) {
+        pPage->iError = GIF_DECODE_ERROR;
+        return 1;
+    }
+    return 0;
+}
+
+"""
 
 def _patch_header(header_path):
     with open(header_path, "r", encoding="utf-8") as file:
@@ -91,25 +106,29 @@ def _patch_header(header_path):
         and max_width_guard
         and max_width_guard.start() < max_width_define.start()
     ):
-        return True
-
-    if OLD_SNIPPET not in text:
+        patched = text
+    elif OLD_SNIPPET in text:
+        patched = text.replace(OLD_SNIPPET, NEW_SNIPPET, 1)
+    else:
         if not max_width_define:
             sys.stderr.write(
                 "WARNING: AnimatedGIF no longer defines MAX_WIDTH in %s\n"
                 % header_path
             )
-            return True
-        sys.stderr.write(
-            "ERROR: AnimatedGIF has an unguarded MAX_WIDTH definition in %s\n"
-            % header_path
-        )
-        raise SystemExit(1)
+            patched = text
+        else:
+            raise RuntimeError("AnimatedGIF has an unguarded MAX_WIDTH definition in %s" % header_path)
 
-    with open(header_path, "w", encoding="utf-8") as file:
-        file.write(text.replace(OLD_SNIPPET, NEW_SNIPPET, 1))
+    if DRAW_END_WITH_ABORT not in patched:
+        if patched.count(DRAW_END) != 1:
+            raise RuntimeError("AnimatedGIF draw structure patch does not match %s" % header_path)
+        patched = patched.replace(DRAW_END, DRAW_END_WITH_ABORT, 1)
 
-    print("Patched AnimatedGIF MAX_WIDTH guard")
+    if patched != text:
+        with open(header_path, "w", encoding="utf-8") as file:
+            file.write(patched)
+        print("Patched AnimatedGIF header")
+
     return True
 
 
@@ -120,6 +139,58 @@ def _patch_decoder(source_path):
     for name, before, after in (
         ("global palette", PALETTE_OLD, PALETTE_NEW),
         ("bounded scanline copy", COPY_OLD, COPY_NEW),
+        (
+            "draw callback helper",
+            "//\n// DecodeLZWTurbo\n",
+            DRAW_HELPER + "//\n// DecodeLZWTurbo\n",
+        ),
+        (
+            "turbo draw abort",
+            "            (*pImage->pfnDraw)(&gd); // callback to handle this line",
+            "            if (GIFDrawLine(pImage, &gd)) return 1;",
+        ),
+        (
+            "scanline declaration",
+            "static void GIFMakePels(GIFIMAGE *pPage, unsigned int code);",
+            "static int GIFMakePels(GIFIMAGE *pPage, unsigned int code);",
+        ),
+        (
+            "scanline definition",
+            "static void GIFMakePels(GIFIMAGE *pPage, unsigned int code)\n{",
+            "static int GIFMakePels(GIFIMAGE *pPage, unsigned int code)\n{",
+        ),
+        (
+            "scanline overflow return",
+            "            return; /* Exit with error */\n        }\n        *(--s) = gifpels[code];",
+            "            return 0;\n        }\n        *(--s) = gifpels[code];",
+        ),
+        (
+            "partial scanline return",
+            "            return;\n        }\n        else  /* Pixels cross into next line */",
+            "            return 0;\n        }\n        else  /* Pixels cross into next line */",
+        ),
+        (
+            "scanline draw abort",
+            "            if (pPage->pfnDraw) {\n"
+            "                (*pPage->pfnDraw)(&gd); // callback to handle this line\n"
+            "            }",
+            "            if (pPage->pfnDraw && GIFDrawLine(pPage, &gd)) return 1;",
+        ),
+        (
+            "scanline completion",
+            "    return;\n} /* GIFMakePels() */",
+            "    return 0;\n} /* GIFMakePels() */",
+        ),
+        (
+            "first LZW code abort",
+            "    GIFMakePels(pImage, code); // first code is output as the first pixel",
+            "    if (GIFMakePels(pImage, code)) return 1;",
+        ),
+        (
+            "LZW loop abort",
+            "            GIFMakePels(pImage, code);",
+            "            if (GIFMakePels(pImage, code)) return 1;",
+        ),
     ):
         if after in text:
             continue
@@ -129,7 +200,7 @@ def _patch_decoder(source_path):
     if text != original:
         with open(source_path, "w", encoding="utf-8") as file:
             file.write(text)
-        print("Patched AnimatedGIF palette and scanline bounds")
+        print("Patched AnimatedGIF palette, scanline bounds, and cancellation")
     return True
 
 

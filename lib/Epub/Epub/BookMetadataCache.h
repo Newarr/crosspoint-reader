@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,7 @@ class BookMetadataCache {
   // writes interleave with zip-inflate SD reads, and unbuffered they thrash
   // SdFat's shared sector cache (one 512B transaction per 4-byte pod). One
   // wrapper serves whichever pass is active (spine, then toc).
-  std::unique_ptr<serialization::BufferedFileWriter> passOut;
+  std::optional<serialization::BufferedFileWriter> passOut;
 
   // Cumulative spine sizes stay in book.bin; RAM holds every SIZE_WINDOW-th one and one window.
   static constexpr int SIZE_WINDOW = 32;
@@ -88,8 +89,6 @@ class BookMetadataCache {
   bool alternateToc = false;
   const char* tocTempFile() const;
 
-  uint32_t writeSpineEntry(HalFile& file, const SpineEntry& entry) const;
-  uint32_t writeTocEntry(HalFile& file, const TocEntry& entry) const;
   SpineEntry readSpineEntry(HalFile& file) const;
   TocEntry readTocEntry(HalFile& file) const;
 
@@ -105,8 +104,7 @@ class BookMetadataCache {
   bool beginContentOpfPass();
   void createSpineEntry(const std::string& href);
   bool endContentOpfPass();
-  bool beginTocPass();
-  bool beginTocPass(bool alternate);
+  bool beginTocPass(bool alternate = false);
   int getTocSpineCoverage() const { return tocSpineCoverage; }
   void selectTocPass(bool alternate, uint16_t count);
   void createTocEntry(const std::string& title, const std::string& href, const std::string& anchor, uint8_t level);

@@ -2,18 +2,17 @@
 
 #include <AnimatedGIF.h>
 #include <Arduino.h>
-#include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <GifCommon.h>
 #include <HalMemory.h>
 #include <HalStorage.h>
+#include <ImageBakeQuantizer.h>
 #include <Logging.h>
 #include <Memory.h>
 
 #include <cstring>
 
 #include "DirectPixelWriter.h"
-#include "DitherUtils.h"
 #include "PixelCache.h"
 
 namespace {
@@ -52,6 +51,15 @@ void updateGrayPalette(const GIFDRAW* pDraw, GifContext& ctx) {
   }
 }
 
+bool continueDecoding(GifContext& ctx) {
+  ImageToFramebufferDecoder::yieldDuringDecode(ctx.lastYieldMs);
+  if (ImageToFramebufferDecoder::isAborted()) {
+    ctx.aborted = true;
+    ctx.success = false;
+  }
+  return ctx.success;
+}
+
 void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
   // Map source rows using the exact output-height ratio. During downscaling,
   // multiple source rows may map to the same output row; during upscaling, a
@@ -71,6 +79,7 @@ void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
   if (!cacheOnly) pw.init(*ctx.renderer);
 
   for (int dstY = firstDstY; dstY < endDstY; ++dstY) {
+    if (dstY != firstDstY && !continueDecoding(ctx)) return;
     ctx.lastDstY = dstY;
     const int outY = ctx.config->y + dstY;
     if (!cacheOnly && outY >= ctx.screenHeight) continue;
@@ -100,7 +109,7 @@ void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
         const uint8_t gray = grayRow[srcX];
         uint8_t ditheredGray;
         if (useDithering) {
-          ditheredGray = applyBayerDither4Level(gray, dstX, dstY);
+          ditheredGray = imagebake::quantizeGray2bit(dstX, dstY, gray);
         } else {
           ditheredGray = gray / 85;
           if (ditheredGray > 3) ditheredGray = 3;
@@ -123,7 +132,7 @@ void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
 }
 
 void processGapRowsUpTo(int canvasY, GifContext& ctx) {
-  while (ctx.success && ctx.nextExpectedSrcY < canvasY && ctx.nextExpectedSrcY < ctx.srcHeight) {
+  while (ctx.nextExpectedSrcY < canvasY && ctx.nextExpectedSrcY < ctx.srcHeight && continueDecoding(ctx)) {
     renderCanvasRow(ctx.whiteRow.get(), ctx.nextExpectedSrcY, ctx);
     ctx.nextExpectedSrcY++;
   }
@@ -183,19 +192,8 @@ int32_t gifSeekWithHandle(GIFFILE* pFile, int32_t position) {
 
 void gifDrawCallback(GIFDRAW* pDraw) {
   auto* ctx = reinterpret_cast<GifContext*>(pDraw->pUser);
-  if (!ctx || !ctx->success || !ctx->grayRow || !ctx->whiteRow) return;
-  if (ImageToFramebufferDecoder::isAborted()) {
-    ctx->aborted = true;
-    ctx->success = false;
-    return;
-  }
-
-  ImageToFramebufferDecoder::yieldDuringDecode(ctx->lastYieldMs);
-  if (ImageToFramebufferDecoder::isAborted()) {
-    ctx->aborted = true;
-    ctx->success = false;
-    return;
-  }
+  pDraw->ucAbort = 1;
+  if (!ctx || !continueDecoding(*ctx)) return;
 
   const int canvasY = pDraw->iY + pDraw->y;
   if (canvasY < 0 || canvasY >= ctx->srcHeight) {
@@ -224,6 +222,7 @@ void gifDrawCallback(GIFDRAW* pDraw) {
 
   renderCanvasRow(ctx->grayRow.get(), canvasY, *ctx);
   ctx->nextExpectedSrcY = canvasY + 1;
+  pDraw->ucAbort = !ctx->success;
 }
 
 bool readGifInfoFromPath(const std::string& imagePath, GifBasicInfo& info) {
@@ -345,8 +344,7 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
 
   ctx.caching = !config.cachePath.empty();
   if (ctx.caching) {
-    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1,
-                         PixelCacheLayout::Versioned, config.useBilinear)) {
+    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1)) {
       LOG_ERR("GIF", "Failed to start cache stream");
       return false;
     }
@@ -355,19 +353,17 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   int delayMs = 0;
   ctx.lastYieldMs = millis();
   const int frameState = gif->playFrame(false, &delayMs, &ctx);
-  if (ctx.aborted || !ctx.success || (gif->getLastError() != GIF_SUCCESS && gif->getLastError() != GIF_EMPTY_FRAME)) {
-    if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
+  const int error = gif->getLastError();
+  const bool frameDecoded = error == GIF_SUCCESS || error == GIF_EMPTY_FRAME;
+  if (ctx.success && frameDecoded) {
+    processGapRowsUpTo(ctx.srcHeight, ctx);
+  }
+  if (!continueDecoding(ctx) || !frameDecoded) {
+    if (ctx.aborted) {
       LOG_DBG("GIF", "GIF decode aborted");
     } else {
-      LOG_ERR("GIF", "GIF decode failed (state=%d, err=%d)", frameState, gif->getLastError());
+      LOG_ERR("GIF", "GIF decode failed (state=%d, err=%d)", frameState, error);
     }
-    if (ctx.caching) ctx.cache.abort();
-    return false;
-  }
-
-  processGapRowsUpTo(ctx.srcHeight, ctx);
-  if (!ctx.success) {
-    LOG_ERR("GIF", "GIF post-process failed: %s", imagePath.c_str());
     if (ctx.caching) ctx.cache.abort();
     return false;
   }
@@ -382,8 +378,4 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   }
 
   return true;
-}
-
-bool GifToFramebufferConverter::supportsFormat(const std::string& extension) {
-  return FsHelpers::hasGifExtension(extension);
 }

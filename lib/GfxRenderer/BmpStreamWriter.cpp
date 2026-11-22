@@ -1,5 +1,6 @@
 #include "BmpStreamWriter.h"
 
+#include <ImageBakeQuantizer.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <Print.h>
@@ -77,14 +78,14 @@ BmpStreamWriter::BmpStreamWriter() = default;
 BmpStreamWriter::~BmpStreamWriter() = default;
 
 bool BmpStreamWriter::begin(Print& output, const int width, const int height, const bool oneBit,
-                            const bool originalThresholds, const QuantizePixel quantizePixel) {
+                            const bool originalThresholds, const Dithering defaultDithering) {
   if (width <= 0 || height <= 0) return false;
 
   this->output = &output;
   this->width = width;
   this->height = height;
   this->oneBit = oneBit;
-  this->quantizePixel = quantizePixel;
+  dithering = originalThresholds ? Dithering::Atkinson : defaultDithering;
   bytesPerRow = (width * (oneBit ? 1 : 2) + 31) / 32 * 4;
 
   packedRow = makeUniqueNoThrow<uint8_t[]>(bytesPerRow);
@@ -93,13 +94,13 @@ bool BmpStreamWriter::begin(Print& output, const int width, const int height, co
     return false;
   }
 
-  if (!quantizePixel && oneBit) {
+  if (dithering == Dithering::Atkinson && oneBit) {
     atkinson1BitDitherer = makeUniqueNoThrow<Atkinson1BitDitherer>(width);
     if (!atkinson1BitDitherer || !atkinson1BitDitherer->isValid()) {
       LOG_ERR("BMP", "OOM: 1-bit ditherer");
       return false;
     }
-  } else if (!quantizePixel) {
+  } else if (dithering == Dithering::Atkinson) {
     atkinsonDitherer = makeUniqueNoThrow<AtkinsonDitherer>(width, originalThresholds);
     if (!atkinsonDitherer || !atkinsonDitherer->isValid()) {
       LOG_ERR("BMP", "OOM: 2-bit ditherer");
@@ -118,20 +119,24 @@ bool BmpStreamWriter::writeRow(const uint8_t* grayRow, const int y) {
   if (!output || !grayRow || y < 0 || y >= height) return false;
   memset(packedRow.get(), 0, bytesPerRow);
 
-  if (oneBit) {
+  const auto pack = [&](const int pixelsPerByte, const auto& levelAt) {
+    const int bitsPerPixel = 8 / pixelsPerByte;
     for (int x = 0; x < width; x++) {
-      const uint8_t level = quantizePixel ? quantizePixel(x, y, adjustPixel(grayRow[x]))
-                                          : atkinson1BitDitherer->processPixel(grayRow[x], x);
-      packedRow[x / 8] |= level << (7 - x % 8);
+      packedRow[x / pixelsPerByte] |= levelAt(x) << (8 - bitsPerPixel * (1 + x % pixelsPerByte));
     }
-    if (!quantizePixel) atkinson1BitDitherer->nextRow();
+  };
+  if (dithering == Dithering::BlueNoise) {
+    if (oneBit) {
+      pack(8, [&](int x) { return imagebake::quantizeGray1bit(x, y, adjustPixel(grayRow[x])); });
+    } else {
+      pack(4, [&](int x) { return imagebake::quantizeGray2bit(x, y, adjustPixel(grayRow[x])); });
+    }
+  } else if (oneBit) {
+    pack(8, [&](int x) { return atkinson1BitDitherer->processPixel(grayRow[x], x); });
+    atkinson1BitDitherer->nextRow();
   } else {
-    for (int x = 0; x < width; x++) {
-      const uint8_t gray = adjustPixel(grayRow[x]);
-      const uint8_t level = quantizePixel ? quantizePixel(x, y, gray) : atkinsonDitherer->processPixel(gray, x);
-      packedRow[x / 4] |= level << (6 - (x % 4) * 2);
-    }
-    if (!quantizePixel) atkinsonDitherer->nextRow();
+    pack(4, [&](int x) { return atkinsonDitherer->processPixel(adjustPixel(grayRow[x]), x); });
+    atkinsonDitherer->nextRow();
   }
 
   if (output->write(packedRow.get(), bytesPerRow) != static_cast<size_t>(bytesPerRow)) {

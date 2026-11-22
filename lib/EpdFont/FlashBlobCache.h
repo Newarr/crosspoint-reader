@@ -33,9 +33,8 @@ const uint8_t* acquire(uint32_t key, uint32_t length, Reader read, void* ctx);
 // ComplexShaper::Blob::release.
 void release(void* data);
 
-// Whether acquire() could ever map this blob: the partition is usable, the
-// blob fits a slot and its copy has not failed. When true, a failed
-// acquire() may succeed later (a copy buffer, a mapped slot freeing up).
+// Whether the partition can hold the blob and its key is still eligible.
+// An unavailable source, slot, or copy buffer can be retried.
 bool canHold(uint32_t key, uint32_t length);
 
 }  // namespace FlashBlobCache

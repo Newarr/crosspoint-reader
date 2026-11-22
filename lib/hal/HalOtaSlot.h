@@ -1,5 +1,8 @@
 #pragma once
 
+#include <esp_flash_partitions.h>
+#include <esp_partition.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -14,6 +17,16 @@ class HalOtaSlot {
     Untracked,
     Unsafe,
   };
+
+  struct BootSelection {
+    const esp_partition_t* partition = nullptr;
+    esp_ota_select_entry_t active{};
+    int activeIndex = -1;
+    uint8_t appCount = 0;
+  };
+
+  static bool readBootSelection(BootSelection& selection);
+  static uint32_t sequenceCrc(uint32_t sequence);
 
   static constexpr size_t ERASE_SIZE = 4096;
 

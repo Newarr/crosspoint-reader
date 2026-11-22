@@ -24,7 +24,7 @@ TEST_F(PixelCacheTest, PublishesCompleteCache) {
   ASSERT_TRUE(cache.begin(path, 4, 1, 0, 0, 1));
   EXPECT_TRUE(cache.finalize());
   EXPECT_TRUE(Storage.exists(path.c_str()));
-  EXPECT_EQ(std::filesystem::file_size(path), 5u);
+  EXPECT_EQ(std::filesystem::file_size(path), 9u);
 }
 TEST_F(PixelCacheTest, RejectsFinalWriteFailure) {
   PixelCache cache;

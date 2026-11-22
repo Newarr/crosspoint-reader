@@ -1,8 +1,8 @@
 #include "JpegToFramebufferConverter.h"
 
-#include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <ImageBakeQuantizer.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -13,7 +13,6 @@
 
 #include "DecoderStorage.h"
 #include "DirectPixelWriter.h"
-#include "DitherUtils.h"
 #include "PixelCache.h"
 #include "SampleRowClamp.h"
 
@@ -40,8 +39,6 @@ struct JpegContext {
   // Fine scale in 16.16 fixed-point (ESP32-C3 has no FPU).
   // X and Y axes use separate scale factors: the aspect ratio of the output (dstWidth/dstHeight)
   // may differ from the source (srcWidth/srcHeight) due to integer rounding of displayHeight.
-  // Using a single (X-based) scale for both axes causes the wrong srcRow to be skipped
-  // during nearest-neighbor downscaling, potentially losing critical image content.
   int32_t fineScaleFPX{1 << 16};  // X: src -> dst column mapping
   int32_t invScaleFPX{1 << 16};   // X: dst -> src column mapping
   int32_t fineScaleFPY{1 << 16};  // Y: src -> dst row mapping
@@ -65,15 +62,19 @@ struct JpegSource {
   int32_t bufferedBytes = 0;
   bool readFailed = false;
 
-  bool open(const std::string& path, bool readAhead) {
+  bool open(const std::string& path) {
     if (!Storage.openFileForRead("JPG", path, file)) return false;
     const size_t fileSize = file.size();
     if (fileSize == 0 || fileSize > INT32_MAX) return false;
     size = static_cast<int32_t>(fileSize);
-    if (readAhead && ESP.getFreeHeap() >= JPEG_SOURCE_BUFFER_BYTES + 16 * 1024) {
-      buffer = makeUniqueNoThrow<uint8_t[]>(JPEG_SOURCE_BUFFER_BYTES);
-    }
     return true;
+  }
+
+  void enableReadAhead() {
+    if (ESP.getFreeHeap() >= JPEG_SOURCE_BUFFER_BYTES + 16 * 1024) {
+      buffer = makeUniqueNoThrow<uint8_t[]>(JPEG_SOURCE_BUFFER_BYTES);
+      bufferStart = position;
+    }
   }
 };
 
@@ -238,7 +239,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     const auto drawRow = [&](const auto& grayAt) {
       for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
         const uint8_t gray = grayAt(dstX);
-        const uint8_t level = useDithering ? applyBayerDither4Level(gray, dstX, dstY) : gray / 85;
+        const uint8_t level = useDithering ? imagebake::quantizeGray2bit(dstX, dstY, gray) : gray / 85;
         const int outX = cfgX + dstX;
         if (!cacheOnly) pw.writePixel(outX, level);
         if (caching) cw.writePixel(outX, level);
@@ -251,24 +252,15 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
       continue;
     }
 
-    const uint32_t sourceY =
-        ctx->config->useBilinear ? samplePosition(dstY, invScaleFPY) : static_cast<uint32_t>(dstY) * invScaleFPY;
-    const SamplePair rows = samplePair(sourceY, blockY, blockH);
+    const SamplePair rows = samplePair(samplePosition(dstY, invScaleFPY), blockY, blockH);
     const uint8_t* row0 = pixels + rows.first * stride;
-    if (ctx->config->useBilinear) {
-      const uint8_t* row1 = pixels + rows.second * stride;
-      drawRow([&](int dstX) {
-        const SamplePair cols = samplePair(samplePosition(dstX, invScaleFPX), blockX, validW);
-        const auto top = interpolateSample(row0[cols.first], row0[cols.second], cols.fraction);
-        const auto bottom = interpolateSample(row1[cols.first], row1[cols.second], cols.fraction);
-        return static_cast<uint8_t>(interpolateSample(top, bottom, rows.fraction));
-      });
-    } else {
-      drawRow([&](int dstX) {
-        const SamplePair cols = samplePair(static_cast<uint32_t>(dstX) * invScaleFPX, blockX, validW);
-        return row0[cols.first];
-      });
-    }
+    const uint8_t* row1 = pixels + rows.second * stride;
+    drawRow([&](int dstX) {
+      const SamplePair cols = samplePair(samplePosition(dstX, invScaleFPX), blockX, validW);
+      const auto top = interpolateSample(row0[cols.first], row0[cols.second], cols.fraction);
+      const auto bottom = interpolateSample(row1[cols.first], row1[cols.second], cols.fraction);
+      return static_cast<uint8_t>(interpolateSample(top, bottom, rows.fraction));
+    });
   }
 
   return 1;
@@ -282,7 +274,7 @@ bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePat
   DecoderStorage<JPEGDEC> storage(false);
   JPEGDEC* jpeg = storage.get();
   JpegSource source;
-  if (!jpeg || !source.open(imagePath, false)) return false;
+  if (!jpeg || !source.open(imagePath)) return false;
 
   if (jpeg->open(&source, source.size, nullptr, jpegRead, jpegSeek, nullptr) != 1 || source.readFailed) {
     LOG_ERR("JPG", "Failed to open JPEG for dimensions (err=%d): %s", jpeg->getLastError(), imagePath.c_str());
@@ -300,17 +292,11 @@ bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePat
 bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
                                                      const RenderConfig& config) {
   bool cacheWritten;
-  return decode(imagePath, renderer, config, PixelCacheLayout::Versioned, cacheWritten);
+  return decodeWithCacheResult(imagePath, renderer, config, cacheWritten);
 }
 
-bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
-                                                     const RenderConfig& config, bool& cacheWritten) {
-  const auto layout = config.cacheOnly ? PixelCacheLayout::Versioned : PixelCacheLayout::PackedRows;
-  return decode(imagePath, renderer, config, layout, cacheWritten);
-}
-
-bool JpegToFramebufferConverter::decode(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config,
-                                        PixelCacheLayout layout, bool& cacheWritten) {
+bool JpegToFramebufferConverter::decodeWithCacheResult(const std::string& imagePath, GfxRenderer& renderer,
+                                                       const RenderConfig& config, bool& cacheWritten) {
   cacheWritten = false;
   LOG_DBG("JPG", "Decoding JPEG: %s", imagePath.c_str());
 
@@ -323,7 +309,7 @@ bool JpegToFramebufferConverter::decode(const std::string& imagePath, GfxRendere
   }
 
   JpegSource source;
-  if (!source.open(imagePath, true)) return false;
+  if (!source.open(imagePath)) return false;
 
   JpegContext ctx;
   ctx.renderer = &renderer;
@@ -423,11 +409,12 @@ bool JpegToFramebufferConverter::decode(const std::string& imagePath, GfxRendere
   ctx.caching = !config.cachePath.empty();
   if (ctx.caching) {
     const int maxBlockDstRows = (int)(((int64_t)16 * ctx.fineScaleFPY) >> FP_SHIFT) + 2;
-    if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows, layout,
-                         config.useBilinear)) {
+    if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
       if (config.cacheOnly) return false;
       LOG_ERR("JPG", "Failed to start cache stream, continuing without caching");
       ctx.caching = false;
+    } else {
+      source.enableReadAhead();
     }
   }
 
@@ -457,8 +444,4 @@ bool JpegToFramebufferConverter::decode(const std::string& imagePath, GfxRendere
   }
 
   return !config.cacheOnly || cacheWritten;
-}
-
-bool JpegToFramebufferConverter::supportsFormat(const std::string& extension) {
-  return FsHelpers::hasJpgExtension(extension);
 }

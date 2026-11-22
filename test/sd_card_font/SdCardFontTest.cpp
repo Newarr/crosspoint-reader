@@ -592,7 +592,9 @@ TEST(SdCardFontTest, SmallCapsPrepareOriginalAndUppercasePackedMetricsWithoutBit
     const size_t lengths[] = {fixture.bytes};
     ASSERT_EQ(font.buildAdvanceTablePacked(segments, lengths, 1, false, false, 1), 0);
     auto* cursor = reinterpret_cast<const uint8_t*>(fixture.words);
-    EXPECT_EQ(font.getAdvance(utf8SmallCapsUpper(utf8NextCodepoint(&cursor)), 0), 0);
+    if (fixture.first > 0x7F) {
+      EXPECT_EQ(font.getAdvance(utf8SmallCapsUpper(utf8NextCodepoint(&cursor)), 0), 0);
+    }
     ASSERT_EQ(font.buildAdvanceTablePacked(segments, lengths, 1, false, false, 1, nullptr, true), 0);
     cursor = reinterpret_cast<const uint8_t*>(fixture.words);
     const auto* end = cursor + fixture.bytes;

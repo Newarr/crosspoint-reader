@@ -2,7 +2,6 @@
 
 #include <HalDisplay.h>
 #include <HalStorage.h>
-#include <ImageBakeQuantizer.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -318,9 +317,8 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   ctx.blocksSinceYield = 0;
   ctx.error = false;
 
-  const auto quantize =
-      originalThresholds ? nullptr : (oneBit ? imagebake::quantizeGray1bit : imagebake::quantizeGray2bit);
-  if (!ctx.output.begin(bmpOut, outWidth, outHeight, oneBit, originalThresholds, quantize)) return false;
+  if (!ctx.output.begin(bmpOut, outWidth, outHeight, oneBit, originalThresholds, BmpStreamWriter::Dithering::BlueNoise))
+    return false;
   if (!smoothUpscale && !ctx.scaler.begin(scaleSrcWidth, scaleSrcHeight, ctx.output)) return false;
 
   // MCU row buffer: MAX_MCU_HEIGHT rows × decoded srcWidth columns of grayscale

@@ -18,8 +18,6 @@ extern HalPowerManager powerManager;  // Singleton
 class HalPowerManager {
   int normalFreq = 0;  // MHz
   bool isLowPower = false;
-  uint32_t lastNormalSpeedPokeMs = 0;
-  bool normalSpeedDwell = false;
 
   mutable int _batteryCachedPercent = 0;         // Last read battery percentage (0-100)
   mutable unsigned long _batteryLastPollMs = 0;  // Timestamp of last battery read in milliseconds
@@ -42,13 +40,11 @@ class HalPowerManager {
 #endif
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
-  static constexpr uint32_t NORMAL_POWER_DWELL_MS = 2000;
 
   void begin();
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
-  void pokeNormalSpeed();
 
 #if FREEINK_MCU_C3
   bool canLightSleep() const;

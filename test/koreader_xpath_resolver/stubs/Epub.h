@@ -16,6 +16,8 @@ class Epub {
 
   explicit Epub(std::vector<std::string> spineContents) : spineContents(std::move(spineContents)) {}
 
+  std::string getCachePath() const { return "/tmp"; }
+
   int getSpineItemsCount() const { return static_cast<int>(spineContents.size()); }
 
   SpineItem getSpineItem(const int spineIndex) const {
