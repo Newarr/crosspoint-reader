@@ -715,7 +715,10 @@ void enterDeepSleep(bool fromTimeout = false) {
       gpio.update();
       mappedInputManager.beginPowerInput(true,
                                          mappedInputManager.isPowerHeld() || gpio.wasReleased(HalGPIO::BTN_POWER));
-      display.begin(true);
+      const bool fastStandbyWake =
+          (isQuickResumeSleep || SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::BLANK) &&
+          renderer.hasFrameBuffer() && SETTINGS.screenInverted == 0 && (!isQuickResumeSleep || sleepFrameFresh);
+      display.begin(true, fastStandbyWake);
       renderer.setOrientation(orientationBeforeStandby);
       deepSleepInProgress = false;
       lastInputTime = millis();
@@ -747,19 +750,9 @@ void enterDeepSleep(bool fromTimeout = false) {
         APP_STATE.showBootScreen = true;
         APP_STATE.saveToFile();
       }
-      const bool sleepScreenPureBw =
-          isQuickResumeSleep || SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::DARK ||
-          SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT ||
-          SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::BLANK;
-      const bool hasBwBaseline =
-          sleepScreenPureBw && renderer.hasFrameBuffer() && (isQuickResumeSleep || SETTINGS.screenInverted == 0);
-      const bool fastStandbyWake =
-          hasBwBaseline &&
-          (isQuickResumeSleep || SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::BLANK);
-      if (hasBwBaseline) {
+      if (fastStandbyWake) {
         renderer.cleanupGrayscaleWithFrameBuffer();
-      }
-      if (!fastStandbyWake) {
+      } else {
         display.requestResync();
       }
       activityManager.finishStandby(true, fastStandbyWake);

@@ -12,13 +12,13 @@ HalDisplay::~HalDisplay() {}
 
 HalDisplay::Controller HalDisplay::getController() const { return BoardConfig::ACTIVE.displayController; }
 
-void HalDisplay::begin(bool seamless) {
+void HalDisplay::begin(bool seamless, bool preserveFrameBuffer) {
   // Set X3-specific panel mode before initializing.
   if (gpio.deviceIsX3()) {
     einkDisplay.setDisplayX3();
   }
 
-  einkDisplay.begin();
+  einkDisplay.begin(preserveFrameBuffer);
 
   if (seamless) {
     // Defuse the SDK's X3 _x3InitialFullSyncsRemaining counter (no-op on X4)
