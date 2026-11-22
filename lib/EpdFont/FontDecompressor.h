@@ -72,15 +72,23 @@ class FontDecompressor {
   uint16_t hotGroupIndex = UINT16_MAX;
   uint8_t* hotGroup = nullptr;  // owned; freed in freeHotGroup()/dtor
   uint32_t hotGroupCapacity = 0;
+  uint32_t hotGroupValidBytes = 0;
+  uint32_t hotGroupFailedBytes = 0;
+  size_t hotGroupFailedMaxAlloc = 0;
+  uint32_t fullGroupFailedBytes = 0;
+  size_t fullGroupFailedMaxAlloc = 0;
 
   // Scratch buffer for compacting a single glyph from the hot group.
   // Valid until the next getBitmap() call. Same ownership/OOM contract as hotGroup.
   uint8_t* hotGlyphBuf = nullptr;
   uint32_t hotGlyphBufCapacity = 0;
+  uint32_t hotGlyphFailedBytes = 0;
+  size_t hotGlyphFailedMaxAlloc = 0;
 
   // Grow (never shrink) an owned buffer to at least `needed` bytes; false on OOM, buffer freed.
   static bool ensureCapacity(uint8_t*& buf, uint32_t& capacity, uint32_t needed);
 
+  static PageGlyphEntry* findPageGlyph(const PageSlot& slot, uint32_t glyphIndex);
   void freePageBuffer();
   void freeHotGroup();
   uint16_t getGroupIndex(const EpdFontData* fontData, uint32_t glyphIndex);

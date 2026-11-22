@@ -29,7 +29,7 @@ int SdCardFontManager::computeFontId(uint32_t contentHash, const char* familyNam
 }
 
 int SdCardFontManager::loadFile(const SdCardFontFamilyInfo& family, const SdCardFontFileInfo& file,
-                                GfxRenderer& renderer, const int fontIdOverride) {
+                                GfxRenderer& renderer, const bool preferFlash, const int fontIdOverride) {
   char path[SdCardFontFamilyInfo::PATH_BUFFER_SIZE];
   if (!family.filePath(file, path, sizeof(path))) {
     LOG_ERR("SDMGR", "Font path too long in family %s", family.name.c_str());
@@ -42,7 +42,7 @@ int SdCardFontManager::loadFile(const SdCardFontFamilyInfo& family, const SdCard
     return 0;
   }
 
-  if (!font->load(path)) {
+  if (!font->load(path, preferFlash)) {
     LOG_ERR("SDMGR", "Failed to load %s", path);
     delete font;
     return 0;
@@ -80,7 +80,7 @@ bool SdCardFontManager::loadFamily(const SdCardFontFamilyInfo& family, GfxRender
     return false;
   }
 
-  if (loadFile(family, *selected, renderer) == 0) {
+  if (loadFile(family, *selected, renderer, true) == 0) {
     return false;
   }
 
@@ -98,13 +98,13 @@ int SdCardFontManager::loadFamilyExtraSize(const SdCardFontFamilyInfo& family, G
   // happens to match a UI size) instead of double-loading the file.
   if (const int loadedId = getFontId(family.name, pointSize); loadedId != 0) return loadedId;
 
-  return loadFile(family, *file, renderer, fontId);
+  return loadFile(family, *file, renderer, false, fontId);
 }
 
 bool SdCardFontManager::loadFamilyVariant(const SdCardFontFamilyInfo& family, GfxRenderer& renderer,
                                           const uint8_t pointSize, const int fontId) {
   const SdCardFontFileInfo* file = family.findFile(pointSize);
-  return file && loadFile(family, *file, renderer, fontId) != 0;
+  return file && loadFile(family, *file, renderer, false, fontId) != 0;
 }
 
 void SdCardFontManager::unloadFont(GfxRenderer& renderer, const int fontId) {

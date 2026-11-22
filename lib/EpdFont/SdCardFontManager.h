@@ -62,7 +62,7 @@ class SdCardFontManager {
   // Load+register one .cpfont of `family` and append it to loaded_.
   // Returns the font id, or 0 on failure (allocation, read, or id collision).
   int loadFile(const SdCardFontFamilyInfo& family, const SdCardFontFileInfo& file, GfxRenderer& renderer,
-               int fontIdOverride = 0);
+               bool preferFlash, int fontIdOverride = 0);
 
   std::string loadedFamilyName_;
   uint8_t loadedPointSize_ = 0;
