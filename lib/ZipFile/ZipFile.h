@@ -8,6 +8,8 @@
 
 class ZipFile {
  public:
+  enum class StreamResult : uint8_t { Ok, Aborted, Error };
+
   struct FileStatSlim {
     uint16_t method;             // Compression method
     uint32_t compressedSize;     // Compressed size
@@ -56,6 +58,8 @@ class ZipFile {
   bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
   bool loadZipDetails();
+  StreamResult streamFile(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop,
+                          bool (*shouldAbort)());
 
  public:
   explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
@@ -78,6 +82,9 @@ class ZipFile {
   // stop (returns true) instead of a write failure — used by header probes
   // that only need the first bytes of an entry.
   bool readFileToStream(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop = false);
+
+  StreamResult readFileToStreamDetailed(const char* filename, Print& out, size_t chunkSize = 1024,
+                                        bool (*shouldAbort)() = nullptr);
 
   template <typename F>
   bool enumerateFilePaths(F&& callback) {

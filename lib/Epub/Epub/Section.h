@@ -15,6 +15,10 @@ class ChapterHtmlSlimParser;
 class CssParser;
 
 class Section {
+ public:
+  enum class BuildError : uint8_t { None, OutOfMemory, Aborted, Other };
+
+ private:
   std::shared_ptr<Epub> epub;
   const int spineIndex;
   GfxRenderer& renderer;
@@ -32,6 +36,8 @@ class Section {
     uint16_t listItemIndex;
     uint32_t visibleTextOffset;
   };
+  enum class HtmlInput : uint8_t { Raw, PendingNormalization, Normalized };
+
   // Held only while an incremental build is in progress (see startBuild). Carries the
   // live parser plus the strings it references (the parser stores them by reference)
   // and the in-RAM page-offset table. The table is a deque so it grows in small chunks: a vector
@@ -46,6 +52,8 @@ class Section {
     std::string htmlPath;
     std::string tmpHtmlPath;
     bool reusedHtml = false;
+    HtmlInput htmlInput = HtmlInput::Raw;
+    ReaderRenderSpec spec;
     CssParser* cssParser = nullptr;
     // HTML byte progress, for estimating the section's total page count while it's still building.
     uint32_t bytesConsumed = 0;
@@ -58,6 +66,11 @@ class Section {
   };
   std::unique_ptr<BuildContext> build_;
   bool buildComplete_ = false;
+  BuildError lastBuildError_ = BuildError::None;
+  bool beginChapterParse(const std::function<void()>& popupFn);
+  bool retryNormalizedChapter(bool (*yieldNow)());
+  bool failBuild(BuildError error);
+  void removeBuildHtml() const;
   // Pages laid out by the active build (== build_->lut.size()). Distinct from pageCount,
   // which is the pages *available to read* and also counts a loaded partial file's pages.
   uint16_t builtPageCount_ = 0;
@@ -98,7 +111,9 @@ class Section {
   // builds. createSectionFile() above is the one-shot wrapper over these.
   //   if (!startBuild(...)) fail;
   //   each tick: buildSomeMore(N); render up to pageCount; when isBuildComplete() stop.
-  bool startBuild(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr);
+  bool startBuild(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr,
+                  bool (*shouldAbort)() = nullptr);
+  BuildError lastBuildError() const { return lastBuildError_; }
   // Lay out up to maxPages more pages (maxPages <= 0 = build to completion). Returns
   // false on error (the build is abandoned). Sets isBuildComplete() when finished.
   // yieldNow, when given, is asked after every parse step (1 KB of HTML, whose callbacks may
@@ -111,7 +126,7 @@ class Section {
   // estimate (pages so far scaled by totalBytes/bytesConsumed, damped by an EMA) while a giant spine
   // is still building, so "page X of Y" / progress don't read off the small build watermark.
   uint16_t estimatedTotalPages() const;
-  void abandonBuild();
+  void abandonBuild(bool keepPartial = false);
   // Persist an in-progress build as a partial section file (version sentinel + LUTs +
   // watermark trailer) instead of discarding it, so the next open of this spine can show
   // its pages instantly and only rebuild in the background. Called by the destructor, so

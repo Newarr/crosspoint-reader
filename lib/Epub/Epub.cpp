@@ -191,7 +191,8 @@ bool Epub::parseTocNcxFile() const {
     return false;
   }
 
-  TocNcxParser ncxParser(contentBasePath, ncxSize, bookMetadataCache.get());
+  const auto ncxContentBasePath = tocNcxItem.substr(0, tocNcxItem.find_last_of('/') + 1);
+  TocNcxParser ncxParser(ncxContentBasePath, ncxSize, bookMetadataCache.get());
 
   if (!ncxParser.setup()) {
     LOG_ERR("EBP", "Could not setup toc ncx parser");
@@ -464,6 +465,19 @@ bool Epub::openProtection() {
 bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   LOG_DBG("EBP", "Loading ePub: %s", filepath.c_str());
 
+  if (!buildIfMissing && !skipLoadingCss && bookMetadataCache && bookMetadataCache->isLoaded() && cssParser) {
+    BookMetadataCache::BookMetadata sourceMetadata;
+    if (!parseContentOpf(sourceMetadata, /*writeSpineEntries=*/false)) return false;
+    discoverCssFilesFromZip();
+    const auto status = cssParser->inspectCache();
+    const auto result = parseCssFiles(status);
+    if (result == CssParser::ParseResult::Error) return false;
+    if (result == CssParser::ParseResult::Complete || status != CssParser::CacheStatus::Partial) {
+      Storage.removeDir((cachePath + "/sections").c_str());
+    }
+    return true;
+  }
+
   if (!openProtection()) return false;
 
   // Initialize spine/TOC cache
@@ -495,20 +509,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     }
     if (!skipLoadingCss) {
       const CssParser::CacheStatus cacheStatus = cssParser->inspectCache();
-      CssParser::CacheLoadResult cacheLoadResult = CssParser::CacheLoadResult::Invalid;
-      if (cacheStatus == CssParser::CacheStatus::Complete) {
-        cacheLoadResult = cssParser->loadFromCache();
-      }
-
-      if (cacheLoadResult == CssParser::CacheLoadResult::LowMemory) {
-        LOG_ERR("EBP", "Insufficient heap to load CSS cache; keeping it for a later retry");
-      } else if (cacheLoadResult != CssParser::CacheLoadResult::Complete) {
+      if (cacheStatus != CssParser::CacheStatus::Complete) {
         LOG_DBG("EBP", "CSS cache missing, partial, or invalid; attempting to parse source stylesheets");
-        if (cacheStatus == CssParser::CacheStatus::Invalid ||
-            (cacheStatus == CssParser::CacheStatus::Complete &&
-             cacheLoadResult == CssParser::CacheLoadResult::Invalid)) {
-          cssParser->deleteCache();
-        }
+        if (cacheStatus == CssParser::CacheStatus::Invalid) cssParser->deleteCache();
 
         BookMetadataCache::BookMetadata cachedMetadata = bookMetadataCache->coreMetadata;
         CssParser::ParseResult cssParseResult = CssParser::ParseResult::Error;
@@ -534,11 +537,6 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
         }
       }
     }
-    // Release the resolved CSS rule map: it is only needed transiently while building
-    // section caches, and createSectionFile reloads it from cache on demand. Holding it
-    // resident pins tens of KB for the whole reading session (more on warm resume into
-    // an already-cached chapter, where createSectionFile never runs to clear it).
-    cssParser->clear();
     LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
     return true;
   }
@@ -556,7 +554,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   LOG_DBG("EBP", "Cache not found, building spine/TOC cache");
   setupCacheDir();
 
-  const uint32_t indexingStart = millis();
+  [[maybe_unused]] const uint32_t indexingStart = millis();
 
   // Begin building cache - stream entries to disk immediately
   if (!bookMetadataCache->beginWrite()) {
@@ -565,7 +563,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   }
 
   // OPF Pass
-  const uint32_t opfStart = millis();
+  [[maybe_unused]] const uint32_t opfStart = millis();
   BookMetadataCache::BookMetadata bookMetadata;
   if (!bookMetadataCache->beginContentOpfPass()) {
     LOG_ERR("EBP", "Could not begin writing content.opf pass");
@@ -582,36 +580,25 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   }
   LOG_DBG("EBP", "OPF pass completed in %lu ms", millis() - opfStart);
 
-  // TOC Pass - try EPUB 3 nav first, fall back to NCX
-  const uint32_t tocStart = millis();
-  if (!bookMetadataCache->beginTocPass()) {
-    LOG_ERR("EBP", "Could not begin writing toc pass");
-    return false;
+  [[maybe_unused]] const uint32_t tocStart = millis();
+  if (!bookMetadataCache->beginTocPass()) return false;
+  const bool navValid = !tocNavItem.empty() && parseTocNavFile();
+  const int navCoverage = bookMetadataCache->getTocSpineCoverage();
+  const int navCount = navValid ? bookMetadataCache->getTocCount() : 0;
+  if (!bookMetadataCache->endTocPass()) return false;
+
+  bool useNcx = false;
+  int ncxCount = 0;
+  if (!tocNcxItem.empty() && (navCount == 0 || navCoverage < bookMetadataCache->getSpineCount())) {
+    if (!bookMetadataCache->beginTocPass(true)) return false;
+    const bool ncxValid = parseTocNcxFile();
+    ncxCount = ncxValid ? bookMetadataCache->getTocCount() : 0;
+    const int ncxCoverage = bookMetadataCache->getTocSpineCoverage();
+    useNcx = ncxCount > 0 && (navCount == 0 || (navCoverage >= 0 && ncxCoverage > navCoverage));
+    if (!bookMetadataCache->endTocPass()) return false;
   }
 
-  bool tocParsed = false;
-
-  // Try EPUB 3 nav document first (preferred)
-  if (!tocNavItem.empty()) {
-    LOG_DBG("EBP", "Attempting to parse EPUB 3 nav document");
-    tocParsed = parseTocNavFile();
-  }
-
-  // Fall back to NCX if nav parsing failed or wasn't available
-  if (!tocParsed && !tocNcxItem.empty()) {
-    LOG_DBG("EBP", "Falling back to NCX TOC");
-    tocParsed = parseTocNcxFile();
-  }
-
-  if (!tocParsed) {
-    LOG_ERR("EBP", "Warning: Could not parse any TOC format");
-    // Continue anyway - book will work without TOC
-  }
-
-  if (!bookMetadataCache->endTocPass()) {
-    LOG_ERR("EBP", "Could not end writing toc pass");
-    return false;
-  }
+  bookMetadataCache->selectTocPass(useNcx, useNcx ? ncxCount : navCount);
   LOG_DBG("EBP", "TOC pass completed in %lu ms", millis() - tocStart);
 
   // Close the cache files
@@ -621,7 +608,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   }
 
   // Build final book.bin
-  const uint32_t buildStart = millis();
+  [[maybe_unused]] const uint32_t buildStart = millis();
   if (!bookMetadataCache->buildBookBin(filepath, bookMetadata)) {
     LOG_ERR("EBP", "Could not update mappings and sizes");
     return false;

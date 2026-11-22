@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "DataUriStripper.h"
 #include "Epub/FootnoteEntry.h"
 #include "Epub/ParsedText.h"
 #include "Epub/blocks/ImageBlock.h"
@@ -145,8 +146,9 @@ class ChapterHtmlSlimParser {
   const ParsedText* layoutParagraph = nullptr;
   bool layoutParagraphHasDropCap = false;
   uint8_t paragraphLinesOnPage = 0;
-  uint8_t keepWithNextLines = 0;                       // trailing heading lines on this page
-  uint32_t recentLineOffsets[MAX_CARRIED_LINES] = {};  // visible offsets of this page's last lines, newest last
+  uint8_t keepWithNextLines = 0;  // trailing heading lines on this page
+  uint32_t recentLineOffsets[MAX_CARRIED_LINES] = {};
+  uint8_t recentLineFootnotes[MAX_CARRIED_LINES] = {};
   uint8_t recentLineCount = 0;
   size_t linesToCarry(size_t& paragraphLines) const;
   size_t keepWithNextCarry() const;
@@ -224,10 +226,28 @@ class ChapterHtmlSlimParser {
   // Footnote link tracking
   bool insideFootnoteLink = false;
   int footnoteLinkDepth = -1;
+  bool collectTouchLinks = true;
   uint8_t currentFootnoteLinkId = 0;
   FootnoteEntry currentFootnote = {};
-  int currentFootnoteLinkTextLen = 0;
-  std::vector<std::pair<int, FootnoteEntry>> pendingFootnotes;  // <wordIndex, entry>
+  size_t currentFootnoteLinkTextLen = 0;
+  class PendingFootnotes {
+    struct Entry {
+      std::pair<int, FootnoteEntry> footnote;
+      std::unique_ptr<Entry> next;
+    };
+
+    std::unique_ptr<Entry> head;
+    Entry* tail = nullptr;
+    size_t count = 0;
+
+   public:
+    ~PendingFootnotes();
+    bool push(int wordIndex, const FootnoteEntry& footnote);
+    void pop();
+    size_t size() const { return count; }
+    bool empty() const { return !head; }
+    const std::pair<int, FootnoteEntry>& front() const { return head->footnote; }
+  } pendingFootnotes;
   int wordsExtractedInBlock = 0;
   // Latched when a ParsedText could not be created (OOM). Together with
   // ParsedText::hadDroppedWords() this turns layout OOM into ParseStatus::Error
@@ -242,12 +262,19 @@ class ChapterHtmlSlimParser {
   // for the lifetime of the parse so it can be paused and resumed at buffer
   // boundaries.
   XML_Parser xmlParser_ = nullptr;
+  DataUriStripper dataUriStripper;
+  bool needsHtmlNormalization_ = false;
+  uint8_t parseStepsSinceHeapCheck = 0;
   HalFile parseFile_;
   uint32_t parseStartTime_ = 0;
 
   void updateEffectiveInlineStyle();
   void startNewTextBlock(const BlockStyle& blockStyle, bool paragraphEnd = true);
   void flushPendingAnchor();
+  bool startNewPage();
+  std::unique_ptr<Page> allocatePage();
+  bool shouldAbortForLowMemory();
+  void failLayoutOom();
   void completeCurrentPage();
   void emitCurrentPage();
   void noteContent(int top, int bottom);
@@ -306,6 +333,8 @@ class ChapterHtmlSlimParser {
       : epub(epub),
         filepath(filepath),
         renderer(renderer),
+        completePageFn(completePageFn),
+        popupFn(popupFn),
         fontId(fontId),
         lineCompression(lineCompression),
         extraParagraphSpacing(extraParagraphSpacing),
@@ -314,8 +343,6 @@ class ChapterHtmlSlimParser {
         viewportHeight(viewportHeight),
         hyphenationEnabled(hyphenationEnabled),
         focusReadingEnabled(focusReadingEnabled),
-        completePageFn(completePageFn),
-        popupFn(popupFn),
         cssParser(cssParser),
         embeddedStyle(embeddedStyle),
         imageRendering(imageRendering),
@@ -329,6 +356,10 @@ class ChapterHtmlSlimParser {
     wordSpacingPercent = wordPercent;
   }
   void setParagraphIndentSpaces(const uint8_t spaces) { paragraphIndentSpaces = spaces; }
+
+  void setCollectTouchLinks(bool collect) { collectTouchLinks = collect; }
+  bool hadLayoutOom() const;
+  bool needsHtmlNormalization() const { return needsHtmlNormalization_; }
 
   // One-shot parse: builds every page before returning (begin + step* + finish).
   bool parseAndBuildPages();
