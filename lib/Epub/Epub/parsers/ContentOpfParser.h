@@ -2,7 +2,7 @@
 #include <Print.h>
 
 #include <algorithm>
-#include <deque>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -65,8 +65,11 @@ class ContentOpfParser final : public Print {
     uint16_t idLen;       // length for collision reduction
     uint32_t fileOffset;  // offset in .items.bin
   };
-  std::deque<ItemIndexEntry> itemIndex;
+  static constexpr size_t MAX_ITEM_INDEX_ENTRIES = 512;
+  std::unique_ptr<ItemIndexEntry[]> itemIndex;
+  size_t itemIndexSize = 0;
   bool useItemIndex = false;
+  bool findItemHrefSequential(const std::string& idref, std::string& href);
 
   // FNV-1a hash function
   static uint32_t fnvHash(const std::string& s) {

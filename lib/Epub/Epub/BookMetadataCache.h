@@ -71,26 +71,22 @@ class BookMetadataCache {
   mutable uint32_t window[SIZE_WINDOW] = {};
   bool fillWindow(int first) const;  // caller holds sizeWindowLock
 
-  // Index for fast href→spineIndex lookup. Exists only during a large EPUB's
-  // TOC pass; a bare deque member would hold its first node for every open book.
   struct SpineHrefIndexEntry {
-    uint64_t hrefHash;  // FNV-1a 64-bit hash
-    uint16_t hrefLen;   // length for collision reduction
+    uint32_t hrefHash;
+    uint32_t fileOffset;
     int16_t spineIndex;
   };
-  std::unique_ptr<std::deque<SpineHrefIndexEntry>> spineHrefIndex;
-
   static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
+  static constexpr uint16_t MAX_SPINE_HREF_INDEX_ENTRIES = 512;
+  std::unique_ptr<SpineHrefIndexEntry[]> spineHrefIndex;
+  uint32_t sequentialSpineOffset = 0;
+  uint16_t sequentialSpineIndex = 0;
+  int16_t findTocSpineIndex(const std::string& href);
 
-  // FNV-1a 64-bit hash function
-  static uint64_t fnvHash64(const std::string& s) {
-    uint64_t hash = 14695981039346656037ull;
-    for (char c : s) {
-      hash ^= static_cast<uint8_t>(c);
-      hash *= 1099511628211ull;
-    }
-    return hash;
-  }
+  std::unique_ptr<uint8_t[]> tocSpinesSeen;
+  int tocSpineCoverage = 0;
+  bool alternateToc = false;
+  const char* tocTempFile() const;
 
   uint32_t writeSpineEntry(HalFile& file, const SpineEntry& entry) const;
   uint32_t writeTocEntry(HalFile& file, const TocEntry& entry) const;
@@ -110,6 +106,9 @@ class BookMetadataCache {
   void createSpineEntry(const std::string& href);
   bool endContentOpfPass();
   bool beginTocPass();
+  bool beginTocPass(bool alternate);
+  int getTocSpineCoverage() const { return tocSpineCoverage; }
+  void selectTocPass(bool alternate, uint16_t count);
   void createTocEntry(const std::string& title, const std::string& href, const std::string& anchor, uint8_t level);
   bool endTocPass();
   bool endWrite();

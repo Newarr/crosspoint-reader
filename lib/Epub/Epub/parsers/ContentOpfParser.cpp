@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #include "Epub/BookMetadataCache.h"
 
@@ -237,6 +238,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     if (self->cache && !Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
     }
+    if (self->tempItemStore) self->itemIndex.reset(new (std::nothrow) ItemIndexEntry[MAX_ITEM_INDEX_ENTRIES]);
     return;
   }
 
@@ -246,15 +248,12 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
     }
 
-    // Sort the (unconditionally-built) item index so every idref lookup uses binary
-    // search. Without this, small/medium manifests fell back to an O(spine × manifest)
-    // linear rescan of .items.bin per itemref (up to ~200ms/item at large scale).
-    if (!self->itemIndex.empty()) {
-      std::sort(self->itemIndex.begin(), self->itemIndex.end(), [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
-        return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
-      });
+    if (self->itemIndex && self->itemIndexSize > 0) {
+      std::sort(self->itemIndex.get(), self->itemIndex.get() + self->itemIndexSize,
+                [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
+                  return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
+                });
       self->useItemIndex = true;
-      LOG_DBG("COF", "Using fast index for %zu manifest items", self->itemIndex.size());
     }
     return;
   }
@@ -325,16 +324,15 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       }
     }
 
-    // Record index entry for fast lookup later
     if (self->tempItemStore) {
-      ItemIndexEntry entry;
-      entry.idHash = fnvHash(itemId);
-      entry.idLen = static_cast<uint16_t>(itemId.size());
-      entry.fileOffset = static_cast<uint32_t>(self->tempItemStore.position());
-      self->itemIndex.push_back(entry);
-    }
-
-    if (self->tempItemStore) {
+      if (self->itemIndex) {
+        if (self->itemIndexSize == MAX_ITEM_INDEX_ENTRIES) {
+          self->itemIndex.reset();
+        } else {
+          self->itemIndex[self->itemIndexSize++] = {fnvHash(itemId), static_cast<uint16_t>(itemId.size()),
+                                                    static_cast<uint32_t>(self->tempItemStore.position())};
+        }
+      }
       serialization::writeString(self->tempItemStore, itemId);
       serialization::writeString(self->tempItemStore, href);
     }
@@ -397,14 +395,15 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
             uint32_t targetHash = fnvHash(idref);
             uint16_t targetLen = static_cast<uint16_t>(idref.size());
 
-            auto it = std::lower_bound(self->itemIndex.begin(), self->itemIndex.end(),
-                                       ItemIndexEntry{targetHash, targetLen, 0},
+            const auto* begin = self->itemIndex.get();
+            const auto* end = begin + self->itemIndexSize;
+            auto it = std::lower_bound(begin, end, ItemIndexEntry{targetHash, targetLen, 0},
                                        [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
                                          return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
                                        });
 
             // Check for match (may need to check a few due to hash collisions)
-            while (it != self->itemIndex.end() && it->idHash == targetHash) {
+            while (it != end && it->idHash == targetHash && it->idLen == targetLen) {
               self->tempItemStore.seek(it->fileOffset);
               std::string itemId;
               serialization::readString(self->tempItemStore, itemId);
@@ -416,18 +415,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
               ++it;
             }
           } else {
-            // Fallback linear scan, only reached when the index is empty (no manifest
-            // items). The fast binary-search path above is used for all real manifests.
-            self->tempItemStore.seek(0);
-            std::string itemId;
-            while (self->tempItemStore.available()) {
-              serialization::readString(self->tempItemStore, itemId);
-              serialization::readString(self->tempItemStore, href);
-              if (itemId == idref) {
-                found = true;
-                break;
-              }
-            }
+            found = self->findItemHrefSequential(idref, href);
           }
 
           if (found && self->cache) {
@@ -464,6 +452,28 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     }
     return;
   }
+}
+
+bool ContentOpfParser::findItemHrefSequential(const std::string& idref, std::string& href) {
+  if (!tempItemStore) return false;
+  const uint32_t startOffset = static_cast<uint32_t>(tempItemStore.position());
+  std::string itemId;
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      if (startOffset == 0) break;
+      if (!tempItemStore.seek(0)) return false;
+    }
+    while (tempItemStore.available() && (pass == 0 || static_cast<uint32_t>(tempItemStore.position()) < startOffset)) {
+      const auto recordOffset = tempItemStore.position();
+      serialization::readString(tempItemStore, itemId);
+      serialization::readString(tempItemStore, href);
+      if (tempItemStore.position() <= recordOffset) break;
+      if (itemId == idref) return true;
+    }
+  }
+  href.clear();
+  tempItemStore.seek(startOffset);
+  return false;
 }
 
 void XMLCALL ContentOpfParser::characterData(void* userData, const XML_Char* s, const int len) {

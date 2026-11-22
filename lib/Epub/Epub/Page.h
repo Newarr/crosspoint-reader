@@ -59,6 +59,7 @@ class PageImage final : public PageElement {
   bool serialize(HalFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
   static std::unique_ptr<PageImage> deserialize(HalFile& file);
+  bool cacheImage(GfxRenderer& renderer, int xOffset, int yOffset) const;
   const ImageBlock& getImageBlock() const { return *imageBlock; }
 };
 
@@ -164,7 +165,9 @@ class Page {
     return true;
   }
 
-  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  bool render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool (*shouldAbort)() = nullptr) const;
+  bool hasImagesNeedingFramebufferLoan() const;
+  bool cacheImagesNeedingDecode(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   void renderWithImagePlaceholders(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   bool serialize(HalFile& file) const;

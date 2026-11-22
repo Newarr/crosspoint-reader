@@ -9,24 +9,29 @@
 namespace {
 
 template <typename Predicate>
-void renderFilteredPageElements(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
-                                const int fontId, const int xOffset, const int yOffset, Predicate&& predicate) {
+bool renderFilteredPageElements(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
+                                const int fontId, const int xOffset, const int yOffset, Predicate&& predicate,
+                                bool (*shouldAbort)() = nullptr) {
   for (const auto& element : elements) {
+    if (shouldAbort && shouldAbort()) return false;
     if (predicate(*element)) {
       element->render(renderer, fontId, xOffset, yOffset);
     }
   }
+  return true;
 }
 
 bool isBorderBox(const PageElement& element) { return element.getTag() == TAG_PageBorderBox; }
 
-void renderBoxBackgrounds(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
-                          const int xOffset, const int yOffset) {
+bool renderBoxBackgrounds(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
+                          const int xOffset, const int yOffset, bool (*shouldAbort)() = nullptr) {
   for (const auto& element : elements) {
+    if (shouldAbort && shouldAbort()) return false;
     if (isBorderBox(*element)) {
       static_cast<const PageBorderBox&>(*element).renderBackground(renderer, xOffset, yOffset);
     }
   }
+  return true;
 }
 
 // Draws one border edge as a strip along a box side.
@@ -287,11 +292,14 @@ std::unique_ptr<PageBorderBox> PageBorderBox::deserialize(HalFile& file) {
 }
 
 // Backgrounds precede every border, including borders inside shaded containers.
-void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderBoxBackgrounds(elements, renderer, xOffset, yOffset);
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, isBorderBox);
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset,
-                             [](const PageElement& element) { return !isBorderBox(element); });
+bool Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                  bool (*shouldAbort)()) const {
+  if (shouldAbort && shouldAbort()) return false;
+  return renderBoxBackgrounds(elements, renderer, xOffset, yOffset, shouldAbort) &&
+         renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, isBorderBox, shouldAbort) &&
+         renderFilteredPageElements(
+             elements, renderer, fontId, xOffset, yOffset,
+             [](const PageElement& element) { return !isBorderBox(element); }, shouldAbort);
 }
 
 void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {

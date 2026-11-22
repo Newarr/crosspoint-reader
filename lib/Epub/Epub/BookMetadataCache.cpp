@@ -2,6 +2,7 @@
 
 #include <BufferedFile.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <Serialization.h>
 #include <Utf8.h>
 #include <ZipFile.h>
@@ -17,6 +18,7 @@ constexpr uint8_t BOOK_CACHE_VERSION = 10;  // v10: ignore ambiguous guide text 
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
+constexpr char tmpAlternateTocBinFile[] = "/toc.alt.bin.tmp";
 // Buffer size for the buildBookBin streams. 3 buffers x 4KB, transient (freed on
 // return); 4KB = 8 SD sectors per transfer, enough to stop the sector-cache thrash.
 constexpr size_t BUILD_IO_BUFFER_SIZE = 4096;
@@ -100,44 +102,37 @@ bool BookMetadataCache::endContentOpfPass() {
   return flushed;
 }
 
-bool BookMetadataCache::beginTocPass() {
-  LOG_DBG("BMC", "Beginning toc pass");
+const char* BookMetadataCache::tocTempFile() const { return alternateToc ? tmpAlternateTocBinFile : tmpTocBinFile; }
 
-  if (!Storage.openFileForRead("BMC", cachePath + tmpSpineBinFile, spineFile)) {
-    return false;
-  }
-  if (!Storage.openFileForWrite("BMC", cachePath + tmpTocBinFile, tocFile)) {
-    // Explicit close() required: member variable persists beyond function scope
+bool BookMetadataCache::beginTocPass() { return beginTocPass(false); }
+
+bool BookMetadataCache::beginTocPass(const bool alternate) {
+  selectTocPass(alternate, 0);
+  if (!Storage.openFileForRead("BMC", cachePath + tmpSpineBinFile, spineFile)) return false;
+  if (!Storage.openFileForWrite("BMC", cachePath + tocTempFile(), tocFile)) {
     spineFile.close();
     return false;
   }
 
-  spineHrefIndex.reset();
-  if (spineCount >= LARGE_SPINE_THRESHOLD) {
-    spineHrefIndex = makeUniqueNoThrow<std::deque<SpineHrefIndexEntry>>();
-    if (!spineHrefIndex) {
-      // createTocEntry then scans the spine file for every TOC entry.
-      LOG_ERR("BMC", "Failed to allocate %u B spine href index; scanning %d spine items per TOC entry",
-              static_cast<unsigned>(sizeof(std::deque<SpineHrefIndexEntry>)), spineCount);
-    }
+  sequentialSpineIndex = 0;
+  sequentialSpineOffset = 0;
+  tocSpinesSeen = spineCount ? makeUniqueNoThrow<uint8_t[]>((spineCount + 7) / 8) : nullptr;
+  tocSpineCoverage = spineCount && !tocSpinesSeen ? -1 : 0;
+
+  if (spineCount <= MAX_SPINE_HREF_INDEX_ENTRIES && spineCount > 0) {
+    spineHrefIndex = makeUniqueNoThrow<SpineHrefIndexEntry[]>(spineCount);
   }
   if (spineHrefIndex) {
-    spineHrefIndex->resize(spineCount);
-    spineFile.seek(0);
-    for (int i = 0; i < spineCount; i++) {
-      auto entry = readSpineEntry(spineFile);
-      SpineHrefIndexEntry idx;
-      idx.hrefHash = fnvHash64(entry.href);
-      idx.hrefLen = static_cast<uint16_t>(entry.href.size());
-      idx.spineIndex = static_cast<int16_t>(i);
-      (*spineHrefIndex)[i] = idx;
+    for (uint16_t i = 0; i < spineCount; i++) {
+      const auto offset = static_cast<uint32_t>(spineFile.position());
+      const auto entry = readSpineEntry(spineFile);
+      const auto hash = static_cast<uint32_t>(ZipFile::fnvHash64(entry.href.data(), entry.href.size()));
+      spineHrefIndex[i] = {hash, offset, static_cast<int16_t>(i)};
     }
-    std::sort(spineHrefIndex->begin(), spineHrefIndex->end(),
+    std::sort(spineHrefIndex.get(), spineHrefIndex.get() + spineCount,
               [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
-                return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
+                return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.spineIndex < b.spineIndex);
               });
-    spineFile.seek(0);
-    LOG_DBG("BMC", "Using fast index for %d spine items", spineCount);
   }
 
   // Wrapper OOM is fine: createTocEntry falls back to unbuffered writes.
@@ -156,8 +151,14 @@ bool BookMetadataCache::endTocPass() {
   spineFile.close();
 
   spineHrefIndex.reset();
+  tocSpinesSeen.reset();
 
   return flushed;
+}
+
+void BookMetadataCache::selectTocPass(const bool alternate, const uint16_t count) {
+  alternateToc = alternate;
+  tocCount = count;
 }
 
 bool BookMetadataCache::endWrite() {
@@ -183,7 +184,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     return false;
   }
 
-  if (!Storage.openFileForRead("BMC", cachePath + tmpTocBinFile, tocFile)) {
+  if (!Storage.openFileForRead("BMC", cachePath + tocTempFile(), tocFile)) {
     // Explicit close() required: member variables persist beyond function scope
     bookFile.close();
     spineFile.close();
@@ -377,6 +378,8 @@ bool BookMetadataCache::cleanupTmpFiles() const {
   if (Storage.exists(tocBinFile.c_str())) {
     Storage.remove(tocBinFile.c_str());
   }
+  const auto alternateBinFile = cachePath + tmpAlternateTocBinFile;
+  if (Storage.exists(alternateBinFile.c_str())) Storage.remove(alternateBinFile.c_str());
   return true;
 }
 
@@ -405,6 +408,43 @@ void BookMetadataCache::createSpineEntry(const std::string& href) {
   spineCount++;
 }
 
+int16_t BookMetadataCache::findTocSpineIndex(const std::string& href) {
+  if (spineHrefIndex) {
+    const auto hash = static_cast<uint32_t>(ZipFile::fnvHash64(href.data(), href.size()));
+    const auto* first = spineHrefIndex.get();
+    const auto* end = first + spineCount;
+    auto* match = std::lower_bound(
+        first, end, hash, [](const SpineHrefIndexEntry& entry, uint32_t hash) { return entry.hrefHash < hash; });
+    for (; match != end && match->hrefHash == hash; ++match) {
+      if (!spineFile.seek(match->fileOffset)) return -1;
+      if (readSpineEntry(spineFile).href == href) return match->spineIndex;
+    }
+    return -1;
+  }
+
+  const uint32_t fileSize = spineFile.size();
+  const uint16_t start = sequentialSpineIndex;
+  if (!spineFile.seek(sequentialSpineOffset)) return -1;
+  std::string spineHref;
+  for (uint16_t step = 0, i = start; step < spineCount; ++step, ++i) {
+    if (i == spineCount) {
+      i = 0;
+      if (!spineFile.seek(0)) return -1;
+    }
+    const auto offset = spineFile.position();
+    if (!serialization::tryReadString(spineFile, spineHref, fileSize) ||
+        !spineFile.seekCur(sizeof(SpineEntry::cumulativeSize) + sizeof(SpineEntry::tocIndex))) {
+      return -1;
+    }
+    if (spineHref == href) {
+      sequentialSpineIndex = i;
+      sequentialSpineOffset = offset;
+      return static_cast<int16_t>(i);
+    }
+  }
+  return -1;
+}
+
 void BookMetadataCache::createTocEntry(const std::string& title, const std::string& href, const std::string& anchor,
                                        const uint8_t level) {
   if (!buildMode || !tocFile || !spineFile) {
@@ -412,37 +452,13 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
     return;
   }
 
-  int16_t spineIndex = -1;
-
-  if (spineHrefIndex) {
-    uint64_t targetHash = fnvHash64(href);
-    uint16_t targetLen = static_cast<uint16_t>(href.size());
-
-    auto it =
-        std::lower_bound(spineHrefIndex->begin(), spineHrefIndex->end(), SpineHrefIndexEntry{targetHash, targetLen, 0},
-                         [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
-                           return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
-                         });
-
-    while (it != spineHrefIndex->end() && it->hrefHash == targetHash && it->hrefLen == targetLen) {
-      spineIndex = it->spineIndex;
-      break;
-    }
-
-    if (spineIndex == -1) {
-      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %s", href.c_str());
-    }
-  } else {
-    spineFile.seek(0);
-    for (int i = 0; i < spineCount; i++) {
-      auto spineEntry = readSpineEntry(spineFile);
-      if (spineEntry.href == href) {
-        spineIndex = static_cast<int16_t>(i);
-        break;
-      }
-    }
-    if (spineIndex == -1) {
-      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %s", href.c_str());
+  const int16_t spineIndex = findTocSpineIndex(href);
+  if (spineIndex >= 0 && tocSpinesSeen) {
+    auto& seen = tocSpinesSeen[spineIndex / 8];
+    const uint8_t mask = 1U << (spineIndex % 8);
+    if (!(seen & mask)) {
+      seen |= mask;
+      tocSpineCoverage++;
     }
   }
 
