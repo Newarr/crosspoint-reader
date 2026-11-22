@@ -18,6 +18,7 @@ class TtfEpdFont;
 #include <array>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -34,7 +35,7 @@ enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 
 
 class GfxRenderer {
  public:
-  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
+  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB, GRAYSCALE_DUAL };
   enum class DitherMode { Replace, PreserveInk };
 
   // Logical screen orientation from the perspective of callers
@@ -54,6 +55,7 @@ class GfxRenderer {
   bool ditherImagesInBw = false;
   Orientation orientation;
   bool fadingFix;
+  mutable bool otaConfirmationPending_ = false;
   uint8_t* frameBuffer = nullptr;
   uint32_t frameBufferLoans = 0;
   uint16_t panelWidth = HalDisplay::DISPLAY_WIDTH;
@@ -62,6 +64,13 @@ class GfxRenderer {
   uint32_t frameBufferSize = HalDisplay::BUFFER_SIZE;
   std::vector<uint8_t*> bwBufferChunks;
   std::map<int, EpdFontFamily> fontMap;
+  static constexpr size_t WIDTH_CACHE_SLOTS = 256;
+  struct WidthCache {
+    uint64_t keys[WIDTH_CACHE_SLOTS] = {};
+    int widths[WIDTH_CACHE_SLOTS];
+    size_t count = 0;
+  };
+  mutable std::unique_ptr<WidthCache> widthCache_;
   // Mutable because ensureSdCardFontReady() is const (called from layout code
   // that holds a const GfxRenderer&) but triggers SD card reads and heap
   // allocation inside the SdCardFont objects. Same pragmatic compromise as
@@ -91,9 +100,11 @@ class GfxRenderer {
   // the BW framebuffer (no storeBwBuffer). Mutable because the render path is
   // const. See beginStripTarget()/endStripTarget().
   mutable uint8_t* _stripBuf = nullptr;
+  mutable uint8_t* _stripMsbBuf = nullptr;
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
+  void drawPixelRaw(int x, int y, bool state) const;
   mutable int clipLeft_ = 0;
   mutable int clipTop_ = 0;
   mutable int clipRight_ = 32767;
@@ -153,6 +164,7 @@ class GfxRenderer {
   void removeFont(int fontId) {
     fontMap.erase(fontId);
     sdCardFonts_.erase(fontId);
+    clearWidthCache();
   }
   void setFontCacheManager(FontCacheManager* m) { fontCacheManager_ = m; }
   FontCacheManager* getFontCacheManager() const { return fontCacheManager_; }
@@ -222,7 +234,7 @@ class GfxRenderer {
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   bool canStageNextFrame() const;
-  bool stageNextFrame() const;
+  bool stageNextFrame(bool (*shouldAbort)(void*) = nullptr, void* abortCtx = nullptr) const;
   bool triggerStagedFastRefresh() const;
   // One-shot: the next displayBuffer(), displayBufferAsync(), or
   // displayGrayscaleBase() call uses `mode`
@@ -262,6 +274,7 @@ class GfxRenderer {
   // after the orientation rotate, so it is orientation-agnostic. Used to render
   // grayscale planes band-by-band without a full second buffer.
   void beginStripTarget(uint8_t* scratch, int stripY0, int stripRows) const;
+  void beginTextGrayscaleStripTargets(uint8_t* lsb, uint8_t* msb, int stripY0, int stripRows) const;
   void endStripTarget() const;
 
   // Band culling for tiled grayscale. Takes a glyph bounding box in logical
@@ -332,6 +345,8 @@ class GfxRenderer {
   // Text
   // Layout may use advance-only SD font tables; rendered measurement includes kerning and ligatures.
   enum class TextMeasureMode { Layout, Rendered };
+  void setWidthCacheEnabled(bool enabled) const;
+  void clearWidthCache() const;
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR,
                    BidiUtils::BidiBaseDir baseDir = BidiUtils::BidiBaseDir::AUTO) const;
   void drawCenteredText(int fontId, int y, const char* text, bool black = true,
@@ -403,7 +418,8 @@ class GfxRenderer {
   void drawVisualText(int fontId, int resolvedFontId, int x, int y, const char* text, bool shapedText, bool black,
                       EpdFontFamily::Style style, int8_t tracking) const;
   int measureVisualText(int resolvedFontId, const char* text, bool shapedText, EpdFontFamily::Style style,
-                        int8_t tracking, TextMeasureMode mode) const;
+                        int8_t tracking, TextMeasureMode mode, bool* cacheable = nullptr) const;
+  int measureCachedWord(int fontId, const char* text, EpdFontFamily::Style style, int8_t tracking) const;
 
  public:
   int getFontAscenderSize(int fontId) const;

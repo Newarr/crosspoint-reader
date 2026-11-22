@@ -1,16 +1,18 @@
 #pragma once
 
+#include <HalStorage.h>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "ComplexShaper.h"
 #include "EpdFont.h"
 #include "EpdFontData.h"
-
-class HalFile;
+#include "SdCardFontCache.h"
 
 // On-disk binary format version for .cpfont files. Defined as a preprocessor
 // macro (rather than a constexpr) so it can be stringified into the SD-fonts
@@ -43,7 +45,10 @@ class SdCardFont {
   // Load .cpfont file: reads header + intervals into RAM, records file layout offsets.
   // Supports v4 (multi-style) format.
   // Returns true on success.
-  bool load(const char* path);
+  bool load(const std::string& path, bool preferFlash = true);
+  void closeFileHandle();
+  bool usingFlash() const;
+  void preloadFlash();
 
   // Pre-read glyphs needed for the given UTF-8 text from SD card.
   // styleMask: bitmask of styles to prewarm (bit 0=regular, 1=bold, 2=italic, 3=bolditalic).
@@ -95,8 +100,7 @@ class SdCardFont {
   // previously fetched metrics.
   void clearCache();
 
-  // Drop the persistent advance cache. Call when unloading the SD font or
-  // when font/size/family/glyph-table state changes, or to recover a failed bitmap allocation.
+  // Release glyph, kerning, ligature and advance caches while keeping coverage.
   void clearPersistentCache();
 
   // Release every rebuildable cache while keeping the font loaded and usable:
@@ -301,7 +305,8 @@ class SdCardFont {
   OverflowContext overflowCtx_[MAX_STYLES] = {};
 
   // Shared on-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler)
-  static constexpr uint32_t OVERFLOW_CAPACITY = 8;
+  static constexpr uint32_t OVERFLOW_CAPACITY = 48;
+  static constexpr uint32_t OVERFLOW_BYTE_BUDGET = 4 * 1024;
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
@@ -309,8 +314,12 @@ class SdCardFont {
     uint8_t styleIdx = 0;
   };
   OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
+  OverflowEntry largeGlyph_{};
   uint32_t overflowCount_ = 0;
   uint32_t overflowNext_ = 0;
+  uint32_t overflowBytes_ = 0;
+  uint32_t overflowSlot(uint32_t age) const;
+  void evictOldestOverflow();
 
   // Compact advance-only table for layout measurement (per-style).
   // Built by buildAdvanceTable(), queried by getAdvance().
@@ -339,6 +348,18 @@ class SdCardFont {
   Stats stats_;
   uint32_t contentHash_ = 0;
   uint32_t fileSize_ = 0;  // bounds glyph bitmap offsets (glyphEntryValid)
+  mutable std::mutex fileMutex_;
+  HalFile fontFile_;
+  bool fontFileOpen_ = false;
+  uint32_t sdPosition_ = 0;
+  SdCardFontCache::ReadHandle flash_;
+  bool preferFlash_ = false;
+  class FontReader;
+  bool loadMetadata(const char* path);
+  bool openFileLocked();
+  void closeFileLocked();
+  bool readAt(uint32_t offset, void* output, size_t length);
+  void clearAdvanceTables();
   uint8_t corruptGlyphsLogged_ = 0;
   static inline std::atomic<bool> corruptGlyphNotice_{false};
   bool loaded_ = false;
@@ -379,7 +400,7 @@ class SdCardFont {
   // ComplexShaper::BlobLoader: maps or reads this style's layout font.
   static bool loadShapingBlob(void* ctx, ComplexShaper::Blob* out);
   // Reads and validates the shaping section header of style `styleIdx`.
-  bool loadShapingSection(HalFile& file, uint8_t styleIdx, uint32_t sectionOffset);
+  bool loadShapingSection(FontReader& file, uint8_t styleIdx, uint32_t sectionOffset);
 
   // Static callback for EpdFontData::coverageHandler: answers hasCodepoint()
   // from the RAM-resident full interval table, without SD I/O.

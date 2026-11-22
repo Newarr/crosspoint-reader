@@ -6,6 +6,7 @@
 #include <ComplexShaper.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
+#include <HalOtaSlot.h>
 #include <IndicReorder.h>
 #include <IndicScripts.h>
 #include <Logging.h>
@@ -66,6 +67,7 @@ namespace {
 struct VisualText {
   const char* text;
   bool shaped;
+  bool cacheableWord = false;
 };
 
 VisualText resolveVisualText(const char* text, std::string& visualBuffer, BidiUtils::BidiBaseDir baseDir,
@@ -100,7 +102,7 @@ const EpdFontData* fontDataFor(const std::map<int, EpdFontFamily>& fonts, const 
 // so the SD advance table must be warmed with the presentation forms as well as
 // the logical codepoints — otherwise every RTL word measurement misses the fast
 // path and falls through to onGlyphMiss(), which opens the .cpfont and reads
-// glyph metadata + bitmap into the 8-slot overflow ring, once per glyph.
+// glyph metadata and its bitmap into the overflow ring.
 // Tokens without RTL lead bytes (0xD6-0xDB) are skipped with a byte scan, so
 // pure-LTR text pays almost nothing.
 void appendShapedRtlTokens(const char* text, std::string& shapedOut) {
@@ -133,18 +135,6 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   if (fontData->vectorBitmapHandler != nullptr) {
     return fontData->vectorBitmapHandler(fontData->glyphMissCtx, glyph);
   }
-  if (fontData->groups != nullptr) {
-    auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
-    if (!fd) {
-      LOG_ERR("GFX", "Compressed font but no FontDecompressor set");
-      return nullptr;
-    }
-    uint32_t glyphIndex = static_cast<uint32_t>(glyph - fontData->glyph);
-    // For page-buffer hits the pointer is stable for the page lifetime.
-    // For hot-group hits it is valid only until the next getBitmap() call — callers
-    // must consume it (draw the glyph) before requesting another bitmap.
-    return fd->getBitmap(fontData, glyph, glyphIndex);
-  }
   // For SD card fonts, check if the glyph was loaded on demand into the overflow
   // buffer.  getOverflowBitmap() returns:
   //   - bitmap pointer for overflow glyphs with bitmap data
@@ -156,6 +146,25 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
     if (sdFont->isOverflowGlyph(glyph)) {
       return sdFont->getOverflowBitmap(glyph);  // may be nullptr for zero-width glyphs
     }
+  }
+  if (!fontData->bitmap || !fontData->glyph || !fontData->intervals || fontData->intervalCount == 0) return nullptr;
+  const auto& last = fontData->intervals[fontData->intervalCount - 1];
+  const uint32_t glyphCount = last.offset + (last.last - last.first) + 1;
+  const auto base = reinterpret_cast<uintptr_t>(fontData->glyph);
+  const auto address = reinterpret_cast<uintptr_t>(glyph);
+  if (address < base || (address - base) % sizeof(EpdGlyph) != 0) return nullptr;
+  const auto glyphIndex = (address - base) / sizeof(EpdGlyph);
+  if (glyphIndex >= glyphCount) return nullptr;
+  if (fontData->groups != nullptr) {
+    auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
+    if (!fd) {
+      LOG_ERR("GFX", "Compressed font but no FontDecompressor set");
+      return nullptr;
+    }
+    // For page-buffer hits the pointer is stable for the page lifetime.
+    // For hot-group hits it is valid only until the next getBitmap() call — callers
+    // must consume it (draw the glyph) before requesting another bitmap.
+    return fd->getBitmap(fontData, glyph, glyphIndex);
   }
   return &fontData->bitmap[glyph->dataOffset];
 }
@@ -207,6 +216,9 @@ void GfxRenderer::ensureSdCardFontReady(const int fontId, const char* const* seg
 }
 
 void GfxRenderer::begin() {
+#if defined(ESP_PLATFORM) && !defined(SIMULATOR)
+  otaConfirmationPending_ = HalOtaSlot::runningImageState() == HalOtaSlot::RunningImageState::PendingVerify;
+#endif
   frameBuffer = display.getFrameBuffer();
   if (!frameBuffer) {
     LOG_ERR("GFX", "!! No framebuffer");
@@ -305,6 +317,7 @@ bool GfxRenderer::isFontCacheScanning() const { return fontCacheManager_ && font
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
   auto result = fontMap.insert({fontId, font});
+  clearWidthCache();
   if (!result.second) {
     LOG_ERR("GFX", "Font ID %d already registered, ignoring duplicate", fontId);
   }
@@ -643,6 +656,11 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
   physical.dyX = nextX - physical.x;
   physical.dyY = nextY - physical.y;
 
+  if (_stripMsbBuf) {
+    glyphBitmap::drawGrayscale(bitmap, width, height, twoBit, state, target, _stripMsbBuf, clip);
+    return;
+  }
+  if (mode == GRAYSCALE_DUAL) return;
   const glyphBitmap::Plane plane = mode == BW              ? glyphBitmap::Plane::BW
                                    : mode == GRAYSCALE_MSB ? glyphBitmap::Plane::GrayMSB
                                                            : glyphBitmap::Plane::GrayLSB;
@@ -665,6 +683,10 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
     return;
   }
 
+  drawPixelRaw(phyX, phyY, state);
+}
+
+inline void GfxRenderer::drawPixelRaw(const int phyX, const int phyY, const bool state) const {
   // Tiled grayscale: redirect writes to the strip scratch and clip to the
   // current band. Single predictable branch on the hot per-pixel path.
   uint8_t* target = frameBuffer;
@@ -679,12 +701,13 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
 
   // Calculate byte position and bit position
   const uint32_t byteIndex = rowY * panelWidthBytes + (phyX / 8);
-  const uint8_t bitPosition = 7 - (phyX % 8);  // MSB first
-
+  const uint8_t mask = 0x80u >> (phyX & 7);
   if (state) {
-    target[byteIndex] &= ~(1 << bitPosition);  // Clear bit
+    target[byteIndex] &= ~mask;
+    if (_stripMsbBuf) _stripMsbBuf[byteIndex] &= ~mask;
   } else {
-    target[byteIndex] |= 1 << bitPosition;  // Set bit
+    target[byteIndex] |= mask;
+    if (_stripMsbBuf) _stripMsbBuf[byteIndex] |= mask;
   }
 }
 
@@ -918,7 +941,9 @@ VisualText resolveVisualText(const char* text, std::string& visualBuffer, const 
   const char* plain =
       scan.rtl || baseDir == BidiUtils::BidiBaseDir::RTL ? resolveBidiText(text, visualBuffer, baseDir) : text;
   if (scan.tokenPlanes) plain = replaceTokenPlanes(plain, visualBuffer);
-  if (!scan.complexScript) return {plain, false};
+  if (!scan.complexScript) {
+    return {plain, false, !scan.rtl && !scan.tokenPlanes && baseDir != BidiUtils::BidiBaseDir::RTL};
+  }
   return resolveComplexText(plain, visualBuffer, fontDataFor(fonts, fontId, style));
 }
 
@@ -1186,32 +1211,26 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   const int32_t panelStride = static_cast<int32_t>(panelWidthBytes);
 
   if constexpr (C == Color::Black || C == Color::White) {
-    // Solid fill. Framebuffer: 0 = black, 1 = white.
-    const uint8_t fillByte = (C == Color::Black) ? 0x00u : 0xFFu;
-    for (int py = phyY0; py <= phyY1; ++py) {
-      uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
+    const uint8_t fillByte = C == Color::Black ? 0x00u : 0xFFu;
+    const auto fill = [&](uint8_t* row) {
+      const auto paint = [&](int byte, uint8_t mask) {
+        if constexpr (C == Color::Black)
+          row[byte] &= static_cast<uint8_t>(~mask);
+        else
+          row[byte] |= mask;
+      };
       if (byteStart == byteEnd) {
-        const uint8_t mask = headMask & tailMask;
-        if constexpr (C == Color::Black) {
-          row[byteStart] &= static_cast<uint8_t>(~mask);
-        } else {
-          row[byteStart] |= mask;
-        }
-      } else {
-        if constexpr (C == Color::Black) {
-          row[byteStart] &= static_cast<uint8_t>(~headMask);
-          if (byteEnd > byteStart + 1) {
-            memset(row + byteStart + 1, fillByte, byteEnd - byteStart - 1);
-          }
-          row[byteEnd] &= static_cast<uint8_t>(~tailMask);
-        } else {
-          row[byteStart] |= headMask;
-          if (byteEnd > byteStart + 1) {
-            memset(row + byteStart + 1, fillByte, byteEnd - byteStart - 1);
-          }
-          row[byteEnd] |= tailMask;
-        }
+        paint(byteStart, headMask & tailMask);
+        return;
       }
+      paint(byteStart, headMask);
+      if (byteEnd > byteStart + 1) memset(row + byteStart + 1, fillByte, byteEnd - byteStart - 1);
+      paint(byteEnd, tailMask);
+    };
+    for (int py = phyY0; py <= phyY1; ++py) {
+      const int32_t offset = static_cast<int32_t>(py - originY) * panelStride;
+      fill(target + offset);
+      if (_stripMsbBuf) fill(_stripMsbBuf + offset);
     }
   } else {
     // Dither (LightGray / DarkGray). Both patterns have period 2 in logical
@@ -1287,32 +1306,31 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
       const uint8_t blackMask = blackMasks[py & 1];
       const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
 
-      uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
-      switch (mode) {
-        case DitherMode::PreserveInk:
+      const auto fill = [&](uint8_t* row) {
+        if (mode == DitherMode::PreserveInk) {
           for (int byte = byteStart; byte <= byteEnd; ++byte) {
             uint8_t mask = blackMask;
             if (byte == byteStart) mask &= headMask;
             if (byte == byteEnd) mask &= tailMask;
             row[byte] &= static_cast<uint8_t>(~mask);
           }
-          continue;
-        case DitherMode::Replace:
-          break;
-      }
-
-      // Replace writes both inks inside the rectangle and leaves other pixels untouched.
-      if (byteStart == byteEnd) {
-        const uint8_t rectMask = headMask & tailMask;
-        row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~rectMask) | (rectMask & whiteMask));
-      } else {
-        row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~headMask) | (headMask & whiteMask));
-        if (byteEnd > byteStart + 1) {
-          // Period 2, so every full byte in this row is exactly whiteMask.
-          memset(row + byteStart + 1, whiteMask, byteEnd - byteStart - 1);
+          return;
         }
-        row[byteEnd] = static_cast<uint8_t>((row[byteEnd] & ~tailMask) | (tailMask & whiteMask));
-      }
+
+        const auto paint = [&](int byte, uint8_t mask) {
+          row[byte] = static_cast<uint8_t>((row[byte] & ~mask) | (mask & whiteMask));
+        };
+        if (byteStart == byteEnd) {
+          paint(byteStart, headMask & tailMask);
+          return;
+        }
+        paint(byteStart, headMask);
+        if (byteEnd > byteStart + 1) memset(row + byteStart + 1, whiteMask, byteEnd - byteStart - 1);
+        paint(byteEnd, tailMask);
+      };
+      const int32_t offset = static_cast<int32_t>(py - originY) * panelStride;
+      fill(target + offset);
+      if (_stripMsbBuf) fill(_stripMsbBuf + offset);
     }
   }
 }
@@ -1805,7 +1823,9 @@ void GfxRenderer::clearScreen(const uint8_t color) const {
   start_ms = millis();
   if (_stripActive) {
     // Clear only the active band's scratch, not the shared framebuffer.
-    memset(_stripBuf, color, static_cast<size_t>(panelWidthBytes) * _stripRows);
+    const size_t bytes = static_cast<size_t>(panelWidthBytes) * _stripRows;
+    memset(_stripBuf, color, bytes);
+    if (_stripMsbBuf) memset(_stripMsbBuf, color, bytes);
     return;
   }
   display.clearScreen(color);
@@ -1817,14 +1837,22 @@ void GfxRenderer::beginStripTarget(uint8_t* scratch, int stripY0, int stripRows)
   // the downstream uint16_t cast in writeGrayscalePlaneStrip.
   assert(scratch != nullptr && stripRows > 0 && stripY0 >= 0 && stripY0 <= static_cast<int>(panelHeight) - stripRows);
   _stripBuf = scratch;
+  _stripMsbBuf = nullptr;
   _stripY0 = stripY0;
   _stripRows = stripRows;
   _stripActive = true;
 }
 
+void GfxRenderer::beginTextGrayscaleStripTargets(uint8_t* lsb, uint8_t* msb, int stripY0, int stripRows) const {
+  assert(msb != nullptr && msb != lsb && !absoluteGrayPlanes);
+  beginStripTarget(lsb, stripY0, stripRows);
+  _stripMsbBuf = msb;
+}
+
 void GfxRenderer::endStripTarget() const {
   _stripActive = false;
   _stripBuf = nullptr;
+  _stripMsbBuf = nullptr;
   _stripY0 = 0;
   _stripRows = 0;
 }
@@ -1861,15 +1889,33 @@ void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   refreshMode = applyPromotedRefresh(refreshMode);
   display.displayBuffer(refreshMode, fadingFix);
+#if defined(ESP_PLATFORM) && !defined(SIMULATOR)
+  if (otaConfirmationPending_) {
+    otaConfirmationPending_ = false;
+    if (HalOtaSlot::confirmRunningImage()) {
+      for (const auto& entry : sdCardFonts_) {
+        if (entry.second) entry.second->preloadFlash();
+      }
+    } else {
+      LOG_ERR("OTA", "Failed to confirm running firmware");
+    }
+  }
+#endif
 }
 
 bool GfxRenderer::canStageNextFrame() const {
   return !fadingFix && !promotedRefreshPending_ && display.canStageNextFrame();
 }
 
-bool GfxRenderer::stageNextFrame() const {
+bool GfxRenderer::stageNextFrame(bool (*shouldAbort)(void*), void* abortCtx) const {
   if (!canStageNextFrame()) return false;
-  return display.stageNextFrame();
+  return [&]<typename Display>(Display& target) {
+    if constexpr (requires { target.stageNextFrame(shouldAbort, abortCtx); }) {
+      return target.stageNextFrame(shouldAbort, abortCtx);
+    } else {
+      return (!shouldAbort || !shouldAbort(abortCtx)) && target.stageNextFrame();
+    }
+  }(display);
 }
 
 bool GfxRenderer::triggerStagedFastRefresh() const {
@@ -1878,14 +1924,11 @@ bool GfxRenderer::triggerStagedFastRefresh() const {
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
-  refreshMode = applyPromotedRefresh(refreshMode);
-  // The async path has no turn-off-screen hook, which the sunlight fading fix
-  // relies on; keep those users on the blocking path.
-  if (fadingFix) {
-    display.displayBuffer(refreshMode, fadingFix);
+  if (fadingFix || otaConfirmationPending_) {
+    displayBuffer(refreshMode);
     return;
   }
-  display.displayBufferAsync(refreshMode);
+  display.displayBufferAsync(applyPromotedRefresh(refreshMode));
 }
 
 void GfxRenderer::waitRefreshComplete() const { display.waitRefreshComplete(); }
@@ -2232,6 +2275,62 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
   return fp4::toPixel(kernFP) + trackingBetween(leftCp, rightCp, tracking);  // snap 4.4 fixed-point to nearest pixel
 }
 
+void GfxRenderer::setWidthCacheEnabled(const bool enabled) const {
+  if (!enabled) {
+    widthCache_.reset();
+  } else if (!widthCache_) {
+    widthCache_ = makeUniqueNoThrow<WidthCache>();
+  }
+}
+
+void GfxRenderer::clearWidthCache() const {
+  if (!widthCache_) return;
+  memset(widthCache_->keys, 0, sizeof(widthCache_->keys));
+  widthCache_->count = 0;
+}
+
+int GfxRenderer::measureCachedWord(const int fontId, const char* text, const EpdFontFamily::Style style,
+                                   const int8_t tracking) const {
+  constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+  constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+  constexpr size_t MAX_WORD_BYTES = 128;
+  uint64_t key = FNV_OFFSET;
+  for (unsigned shift = 0; shift < 32; shift += 8) {
+    key = (key ^ ((static_cast<uint32_t>(fontId) >> shift) & 0xFFu)) * FNV_PRIME;
+  }
+  key = (key ^ static_cast<uint8_t>(style)) * FNV_PRIME;
+  key = (key ^ static_cast<uint8_t>(tracking)) * FNV_PRIME;
+  size_t length = 0;
+  for (const auto* byte = reinterpret_cast<const uint8_t*>(text); *byte != 0; ++byte) {
+    if (++length > MAX_WORD_BYTES || *byte <= ' ') {
+      return measureVisualText(fontId, text, false, style, tracking, TextMeasureMode::Layout);
+    }
+    key = (key ^ *byte) * FNV_PRIME;
+  }
+  if (key == 0) key = 1;
+
+  constexpr size_t slotMask = WIDTH_CACHE_SLOTS - 1;
+  size_t slot = key & slotMask;
+  auto& cache = *widthCache_;
+  while (cache.keys[slot] != 0) {
+    if (cache.keys[slot] == key) return cache.widths[slot];
+    slot = (slot + 1) & slotMask;
+  }
+
+  bool cacheable = true;
+  const int width = measureVisualText(fontId, text, false, style, tracking, TextMeasureMode::Layout, &cacheable);
+  if (cacheable) {
+    if (cache.count >= WIDTH_CACHE_SLOTS * 3 / 4) {
+      clearWidthCache();
+      slot = key & slotMask;
+    }
+    cache.keys[slot] = key;
+    cache.widths[slot] = width;
+    ++cache.count;
+  }
+  return width;
+}
+
 int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style, const int8_t tracking,
                                  const BidiUtils::BidiBaseDir baseDir, const TextMeasureMode mode) const {
   // Match the font drawText would use for non-Latin strings (see resolveTextFontId).
@@ -2244,12 +2343,20 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   // right margin.
   std::string visual;
   const VisualText visualText = resolveVisualText(text, visual, baseDir, fontMap, resolvedFontId, style);
+  if (widthCache_ && mode == TextMeasureMode::Layout && visualText.cacheableWord &&
+      !ttfFonts_.contains(resolvedFontId)) {
+    const auto sdFont = sdCardFonts_.find(resolvedFontId);
+    if (sdFont == sdCardFonts_.end() || sdFont->second->hasAdvanceTable()) {
+      return measureCachedWord(resolvedFontId, visualText.text, style, tracking);
+    }
+  }
   return measureVisualText(resolvedFontId, visualText.text, visualText.shaped, style, tracking, mode);
 }
 
 int GfxRenderer::getTextAdvanceX(const int fontId, const LaidOutText& text, const EpdFontFamily::Style style,
                                  const int8_t tracking, const BidiUtils::BidiBaseDir baseDir,
                                  const TextMeasureMode mode) const {
+  if (text.display == nullptr) return getTextAdvanceX(fontId, text.text, style, tracking, baseDir, mode);
   const int resolvedFontId = resolveTextFontId(fontId, text.text, style);
   std::string visual;
   const VisualText visualText = resolveLaidOutText(text, visual, baseDir, fontMap, resolvedFontId, style);
@@ -2257,8 +2364,8 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const LaidOutText& text, cons
 }
 
 int GfxRenderer::measureVisualText(const int resolvedFontId, const char* text, const bool shapedText,
-                                   const EpdFontFamily::Style style, const int8_t tracking,
-                                   const TextMeasureMode mode) const {
+                                   const EpdFontFamily::Style style, const int8_t tracking, const TextMeasureMode mode,
+                                   bool* cacheable) const {
   // Advance table fast-path for SD card fonts during layout.
   // Snap each advance like drawText. Kerning/ligature data is not resident
   // during layout, so kerned-pair steps can still differ.
@@ -2271,6 +2378,7 @@ int GfxRenderer::measureVisualText(const int resolvedFontId, const char* text, c
     const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
     const auto fontIt = fontMap.find(resolvedFontId);
     if (fontIt == fontMap.end()) {
+      if (cacheable) *cacheable = false;
       LOG_ERR("GFX", "Font %d not found", resolvedFontId);
       return 0;
     }
@@ -2297,6 +2405,7 @@ int GfxRenderer::measureVisualText(const int resolvedFontId, const char* text, c
       cp = smallCapCp;
       int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
       if (advFP == 0 || (syntheticGlyph::isSolid(cp) && !font.hasCodepoint(cp, style))) {
+        if (cacheable) *cacheable = false;
         EpdGlyph solidFallback;
         const EpdGlyph* glyph = font.getGlyphMetrics(cp, solidFallback, style);
         advFP = glyph ? glyph->advanceX : 0;
@@ -2313,6 +2422,7 @@ int GfxRenderer::measureVisualText(const int resolvedFontId, const char* text, c
 
   const auto fontIt = fontMap.find(resolvedFontId);
   if (fontIt == fontMap.end()) {
+    if (cacheable) *cacheable = false;
     LOG_ERR("GFX", "Font %d not found", resolvedFontId);
     return 0;
   }
