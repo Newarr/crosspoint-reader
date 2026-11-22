@@ -365,6 +365,7 @@ void ActivityManager::finishStandby(bool woke) {
   RenderLock lock;
   standbyScreenActive = false;
   if (woke) {
+    ++screenVisit;
     requestUpdate(true);
     return;
   }

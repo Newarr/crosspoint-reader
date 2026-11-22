@@ -679,18 +679,31 @@ void EpubReaderActivity::stageNextPageIfIdle() {
   auto p = section->loadPage(targetPage);
   if (!p) return;
 
+  struct IdleStageAbort {
+    uint32_t startSeq = 0;
+    bool latched = false;
+  };
+  static IdleStageAbort stageAbort;
+  stageAbort = {gpio.pressSequence(), false};
+  const auto stageCancelled = []() -> bool {
+    if (!stageAbort.latched && (buttonContactClosed() || gpio.pressSequence() != stageAbort.startSeq)) {
+      stageAbort.latched = true;
+    }
+    return stageAbort.latched;
+  };
   struct IdleDecodeGuard {
     void* ctx = nullptr;
     ImageToFramebufferDecoder::AbortFn fn = nullptr;
-    IdleDecodeGuard() {
+    IdleDecodeGuard(bool (*abortFn)()) {
       ImageToFramebufferDecoder::getAbortCheck(ctx, fn);
-      ImageToFramebufferDecoder::setAbortCheck(nullptr, [](void*) { return buttonContactClosed(); });
+      ImageToFramebufferDecoder::setAbortCheck(reinterpret_cast<void*>(abortFn),
+                                               [](void* p) { return reinterpret_cast<bool (*)()>(p)(); });
     }
     ~IdleDecodeGuard() {
       ImageBlock::releaseRenderCache();
       ImageToFramebufferDecoder::setAbortCheck(ctx, fn);
     }
-  } decodeGuard;
+  } decodeGuard(+stageCancelled);
 
   const auto t0 = millis();
   const int fontId = spec.fontId;
@@ -698,7 +711,10 @@ void EpubReaderActivity::stageNextPageIfIdle() {
   if (pageHasImages) {
     if (p->hasImagesNeedingFramebufferLoan()) {
       const bool cached = cacheImagesWithFramebufferLoan(*p, fontId, left, top);
-      if (buttonContactClosed()) return;
+      if (stageCancelled()) {
+        stageAttempted = false;
+        return;
+      }
       stageAttempted = true;
       if (!cached) return;
     }
@@ -708,7 +724,7 @@ void EpubReaderActivity::stageNextPageIfIdle() {
       if (ESP.getFreeHeap() < IDLE_IMG_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < IDLE_IMG_MIN_MAX_ALLOC) return;
       pageBufferStale = true;
       p->renderImages(renderer, fontId, left, top);
-      if (buttonContactClosed()) {
+      if (stageCancelled()) {
         stageAttempted = false;
         return;
       }
@@ -726,14 +742,16 @@ void EpubReaderActivity::stageNextPageIfIdle() {
   renderer.setDitherImagesInBw(pageHasImages);
   renderer.clearScreen();
   drawClippingHighlights(*p, fontId, top, left);
-  const bool rendered = p->render(renderer, fontId, left, top, &buttonContactClosed) && !buttonContactClosed();
+  const bool rendered = p->render(renderer, fontId, left, top, +stageCancelled) && !stageCancelled();
   renderer.setDitherImagesInBw(false);
   if (rendered) renderStatusBar();
 
   section->currentPage = origPage;
   currentPageBookmarked = origBookmarked;
 
-  if (!rendered || !renderer.stageNextFrame([](void*) { return buttonContactClosed(); }, nullptr)) {
+  if (!rendered || stageCancelled() ||
+      !renderer.stageNextFrame([](void* p) { return reinterpret_cast<bool (*)()>(p)(); },
+                               reinterpret_cast<void*>(+stageCancelled))) {
     stageAttempted = false;
     return;
   }
@@ -854,14 +872,21 @@ bool EpubReaderActivity::deferredImageGrayTick() {
     GfxRenderer& renderer;
     void* ctx;
     ImageToFramebufferDecoder::AbortFn fn;
+    uint32_t startSeq;
+    bool latched = false;
+    bool check() {
+      if (!latched && (buttonContactClosed() || gpio.pressSequence() != startSeq)) latched = true;
+      return latched;
+    }
     ~GrayUpgradeGuard() {
       renderer.setRenderMode(GfxRenderer::BW);
       display.setOverlayFullTone(false);
       ImageBlock::releaseRenderCache();
       ImageToFramebufferDecoder::setAbortCheck(ctx, fn);
     }
-  } guard{renderer, prevAbortCtx, prevAbortFn};
-  ImageToFramebufferDecoder::setAbortCheck(nullptr, [](void*) { return buttonContactClosed(); });
+  } guard{renderer, prevAbortCtx, prevAbortFn, gpio.pressSequence()};
+  ImageToFramebufferDecoder::setAbortCheck(
+      &guard, [](void* ctx) { return static_cast<GrayUpgradeGuard*>(ctx)->check(); });
   display.setOverlayFullTone(true);
 
   const int fontId = SETTINGS.getReaderFontId();
@@ -879,31 +904,31 @@ bool EpubReaderActivity::deferredImageGrayTick() {
   const auto t0 = millis();
   renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
   for (int y = 0; y < gh; y += GRAYSCALE_STRIP_ROWS) {
-    if (buttonContactClosed()) return abortUpgrade();
+    if (guard.check()) return abortUpgrade();
     const int rows = std::min(GRAYSCALE_STRIP_ROWS, gh - y);
     renderer.beginStripTarget(scratch, y, rows);
     renderer.clearScreen(0x00);
     p->renderImages(renderer, fontId, deferredImageGrayLeft, deferredImageGrayTop);
     renderer.endStripTarget();
-    if (buttonContactClosed()) return abortUpgrade();
+    if (guard.check()) return abortUpgrade();
     renderer.writeGrayscalePlaneStrip(true, scratch, y, rows);
     wroteStrip = true;
   }
 
   renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
   for (int y = 0; y < gh; y += GRAYSCALE_STRIP_ROWS) {
-    if (buttonContactClosed()) return abortUpgrade();
+    if (guard.check()) return abortUpgrade();
     const int rows = std::min(GRAYSCALE_STRIP_ROWS, gh - y);
     renderer.beginStripTarget(scratch, y, rows);
     renderer.clearScreen(0x00);
     p->renderImages(renderer, fontId, deferredImageGrayLeft, deferredImageGrayTop);
     renderer.endStripTarget();
-    if (buttonContactClosed()) return abortUpgrade();
+    if (guard.check()) return abortUpgrade();
     renderer.writeGrayscalePlaneStrip(false, scratch, y, rows);
     wroteStrip = true;
   }
 
-  if (buttonContactClosed()) return abortUpgrade();
+  if (guard.check()) return abortUpgrade();
 
   renderer.displayGrayBuffer();
   pageGrayOverlayActive = true;
@@ -2580,12 +2605,23 @@ void EpubReaderActivity::renderBook() {
     clearPreloadedNextPage();
     releaseGrayscaleStripScratch();
     if (auto* fcm = renderer.getFontCacheManager()) fcm->releaseSdFontCaches();
+    const std::string sectionBin = epub->getCachePath() + "/sections/" + std::to_string(currentSpineIndex) + ".bin";
+    const std::string styledBackup = sectionBin + ".styled";
+    const bool preservedPartial = Storage.exists(sectionBin.c_str()) && Storage.rename(sectionBin.c_str(), styledBackup.c_str());
     embeddedStyleDisabledForBook = true;
     if (backgroundBuildFailedSpine == currentSpineIndex) backgroundBuildFailedSpine = -1;
     buildPopupPending = false;
     renderSpec = makeRenderSpec(viewportWidth, viewportHeight);
     LOG_INF("ERS", "Retrying EPUB build without embedded style after low memory");
     result = prepareSectionForRender(renderSpec);
+    if (preservedPartial) {
+      if (result == SectionRenderResult::Ready) {
+        Storage.remove(styledBackup.c_str());
+      } else {
+        section.reset();
+        Storage.replaceFile(styledBackup.c_str(), sectionBin.c_str());
+      }
+    }
   }
   if (result != SectionRenderResult::Ready) {
     section.reset();

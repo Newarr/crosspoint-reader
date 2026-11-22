@@ -17,6 +17,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <SPI.h>
+#include <SdCardFont.h>
 #include <TrustedTime.h>
 #include <VectorFontSupport.h>
 #include <WiFi.h>
@@ -455,7 +456,7 @@ static bool loadSleepFrameBuffer() {
 #if FREEINK_MCU_C3
 static bool sleepWhileDisplayBusy(int8_t busyPin, uint8_t busyLevel) {
   if (bleturner::holdsHeap() || !powerManager.lightSleepWhileDisplayBusy(busyPin, busyLevel)) return false;
-  vTaskDelay(pdMS_TO_TICKS(5));
+  if (digitalRead(busyPin) == busyLevel) vTaskDelay(pdMS_TO_TICKS(5));
   return true;
 }
 
@@ -753,11 +754,15 @@ void enterDeepSleep(bool fromTimeout = false) {
       deepSleepInProgress = false;
       lastInputTime = millis();
       lastActivityTime = lastInputTime;
+      allowSleepAt = lastInputTime + 2000;
     }
     activityManager.finishStandby(woke);
     if (woke) return;
   }
 #endif
+  for (const auto& entry : renderer.getSdCardFonts()) {
+    if (entry.second) entry.second->closeFileHandle();
+  }
   Storage.prepareForDeepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 

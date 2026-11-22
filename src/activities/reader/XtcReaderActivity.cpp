@@ -343,16 +343,13 @@ void XtcReaderActivity::saveProgress() const {
 
 void XtcReaderActivity::loadProgress() {
   if (!xtc) return;
-  HalFile f;
-  if (Storage.openFileForRead("XTC", xtc->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[4];
-    if (f.read(data, 4) == 4) {
-      currentPage = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
-      if (currentPage >= xtc->getPageCount() && xtc->getPageCount() > 0) {
-        currentPage = xtc->getPageCount() - 1;
-      }
-      LOG_DBG("XTC", "Loaded progress: page %lu/%lu", currentPage + 1, xtc->getPageCount());
+  uint8_t data[4];
+  if (ProgressFile::readAtomic(xtc->getCachePath(), data, sizeof(data)) == sizeof(data)) {
+    currentPage = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+    if (currentPage >= xtc->getPageCount() && xtc->getPageCount() > 0) {
+      currentPage = xtc->getPageCount() - 1;
     }
+    LOG_DBG("XTC", "Loaded progress: page %lu/%lu", currentPage + 1, xtc->getPageCount());
   }
 }
 

@@ -121,11 +121,7 @@ inline bool writeAtomic(const std::string& cachePath, const uint8_t* data, size_
       return false;
     }
   }
-
-  // Home and XTC still read the legacy file directly.
-  const std::string legacy = cachePath + "/progress.bin";
-  const std::string temp = legacy + ".tmp";
-  return detail::writeFile(temp, data, len) && Storage.replaceFile(temp.c_str(), legacy.c_str());
+  return true;
 }
 
 }  // namespace ProgressFile

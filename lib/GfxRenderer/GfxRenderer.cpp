@@ -1919,7 +1919,7 @@ bool GfxRenderer::stageNextFrame(bool (*shouldAbort)(void*), void* abortCtx) con
 }
 
 bool GfxRenderer::triggerStagedFastRefresh() const {
-  if (!canStageNextFrame()) return false;
+  if (fadingFix || promotedRefreshPending_ || otaConfirmationPending_) return false;
   return display.triggerStagedFastRefresh(fadingFix);
 }
 

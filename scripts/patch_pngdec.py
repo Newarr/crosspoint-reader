@@ -65,6 +65,62 @@ def patch_decoder(source):
         "        }\n"
         "        pPage->ucBpp = s[24];",
     )
+    source = replace(
+        source,
+        "            case 0x504c5445: //'PLTE' palette colors\n"
+        "                memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified\n"
+        "                memcpy(pPage->ucPalette, &s[iOffset], iLen);",
+        "            case 0x504c5445: //'PLTE' palette colors\n"
+        "                if (iLen > 768 || (iLen % 3) != 0) {\n"
+        "                    pPage->iError = PNG_DECODE_ERROR;\n"
+        "                    return 1;\n"
+        "                }\n"
+        "                if (iOffset + iLen > iBytesRead) {\n"
+        "                    iFileOffset += (iOffset - iBytesRead);\n"
+        "                    (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);\n"
+        "                    iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, PNG_FILE_BUF_SIZE);\n"
+        "                    if (iBytesRead < iLen) {\n"
+        "                        pPage->iError = PNG_DECODE_ERROR;\n"
+        "                        return 1;\n"
+        "                    }\n"
+        "                    iFileOffset += iBytesRead;\n"
+        "                    iOffset = 0;\n"
+        "                }\n"
+        "                memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified\n"
+        "                memcpy(pPage->ucPalette, &s[iOffset], iLen);",
+    )
+    source = replace(
+        source,
+        "            case 0x74524e53: //'tRNS' transparency info\n"
+        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED) // if palette exists\n"
+        "                {\n"
+        "                    memcpy(&pPage->ucPalette[768], &s[iOffset], iLen);\n"
+        "                    pPage->iHasAlpha = 1;\n"
+        "                }",
+        "            case 0x74524e53: //'tRNS' transparency info\n"
+        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED || iLen == 2 || iLen == 6) {\n"
+        "                    if (pPage->ucPixelType == PNG_PIXEL_INDEXED && iLen > 256) {\n"
+        "                        pPage->iError = PNG_DECODE_ERROR;\n"
+        "                        return 1;\n"
+        "                    }\n"
+        "                    if (iOffset + iLen > iBytesRead) {\n"
+        "                        iFileOffset += (iOffset - iBytesRead);\n"
+        "                        (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);\n"
+        "                        iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, PNG_FILE_BUF_SIZE);\n"
+        "                        if (iBytesRead < iLen) {\n"
+        "                            pPage->iError = PNG_DECODE_ERROR;\n"
+        "                            return 1;\n"
+        "                        }\n"
+        "                        iFileOffset += iBytesRead;\n"
+        "                        iOffset = 0;\n"
+        "                    }\n"
+        "                }\n"
+        "                if (pPage->ucPixelType == PNG_PIXEL_INDEXED) // if palette exists\n"
+        "                {\n"
+        "                    memcpy(&pPage->ucPalette[768], &s[iOffset], iLen);\n"
+        "                    pPage->iHasAlpha = 1;\n"
+        "                }",
+    )
     return replace(
         source,
         "                        iFileOffset += iBytesRead;\n"
@@ -92,7 +148,7 @@ TARGETS = (
      "d9deb1e586738384f2b996acb2fa80219670ba1ef3a5138ed8559ca59837e5c1"),
     ("png.inl", patch_decoder,
      "8008f43fb74e578df3651791da4fb4ac74cb87f946ec6910aeab703fa5b5ea65",
-     "dc2bc69ec54b119f2ac5a85871394b601d7d043d4061db192c3d8b8673409e47"),
+     "e4d4448c2ac3db721fb885bc7a55d73f4c61a53932e802f7ed05c320fb48fd27"),
 )
 
 

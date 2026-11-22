@@ -119,6 +119,20 @@ struct LightSleepPin {
 template <size_t Count>
 esp_sleep_wakeup_cause_t lightSleep(const LightSleepPin (&pins)[Count], uint64_t timeoutUs) {
   constexpr uint32_t WAKE_PAD_FLAGS = FUN_IE | SLP_SEL;
+  constexpr UBaseType_t LIGHT_SLEEP_PRIORITY = 3;
+  const UBaseType_t savedPriority = uxTaskPriorityGet(nullptr);
+  if (savedPriority < LIGHT_SLEEP_PRIORITY) vTaskPrioritySet(nullptr, LIGHT_SLEEP_PRIORITY);
+  // Keep SD power (GPIO13), SD CS, EPD CS, and EPD RST driven across C3 light sleep:
+  // esp_sleep_startup_init() arms SLP_SEL isolation on all GPIOs, which would cut SD power.
+  const int8_t keepPins[] = {static_cast<int8_t>(XTEINK_C3_GPIO13), BoardConfig::ACTIVE.sd.cs, EPD_CS, EPD_RST};
+  uint32_t savedKeepSlpSel[sizeof(keepPins)]{};
+  for (size_t i = 0; i < sizeof(keepPins); ++i) {
+    if (keepPins[i] < 0) continue;
+    const auto mux = GPIO_PIN_MUX_REG[keepPins[i]];
+    savedKeepSlpSel[i] = REG_READ(mux) & SLP_SEL;
+    REG_CLR_BIT(mux, SLP_SEL);
+  }
+
   uint32_t savedPadFlags[Count];
   size_t armed = 0;
   bool ready = true;
@@ -146,6 +160,12 @@ esp_sleep_wakeup_cause_t lightSleep(const LightSleepPin (&pins)[Count], uint64_t
     const auto mux = GPIO_PIN_MUX_REG[pins[i].pin];
     REG_WRITE(mux, (REG_READ(mux) & ~WAKE_PAD_FLAGS) | savedPadFlags[i]);
   }
+  for (size_t i = 0; i < sizeof(keepPins); ++i) {
+    if (keepPins[i] < 0) continue;
+    const auto mux = GPIO_PIN_MUX_REG[keepPins[i]];
+    REG_WRITE(mux, (REG_READ(mux) & ~SLP_SEL) | savedKeepSlpSel[i]);
+  }
+  if (savedPriority < LIGHT_SLEEP_PRIORITY) vTaskPrioritySet(nullptr, savedPriority);
   return cause;
 }
 
@@ -171,12 +191,59 @@ bool HalPowerManager::lightSleepWhileDisplayBusy(int8_t busyPin, uint8_t busyLev
 
 bool HalPowerManager::lightSleepStandby() const {
   static constexpr LightSleepPin pins[] = {{GPIO_NUM_3, GPIO_INTR_LOW_LEVEL}};
-  static constexpr uint64_t STANDBY_US = 3600ULL * 1000000;
+  static constexpr int64_t STANDBY_US = 3600LL * 1000000LL;
+  static constexpr int64_t USB_POLL_SLICE_US = 2000000LL;
+  static constexpr uint32_t RELEASE_STABLE_MS = 30;
+  static constexpr uint32_t PRESS_STABLE_MS = 15;
+  static constexpr uint32_t USB_ENUM_WAIT_MS = 300;
   if (!canLightSleep()) return false;
-  while (gpio.isPowerButtonPhysicallyPressed()) delay(5);
-  if (!canLightSleep()) return false;
-  const auto cause = lightSleep(pins, STANDBY_US);
-  return cause == ESP_SLEEP_WAKEUP_GPIO || gpio.isPowerButtonPhysicallyPressed();
+  uint32_t stableHighMs = 0;
+  while (stableHighMs < RELEASE_STABLE_MS) {
+    if (gpio.isPowerButtonPhysicallyPressed()) {
+      stableHighMs = 0;
+    } else {
+      stableHighMs += 5;
+    }
+    delay(5);
+  }
+
+  static const BatteryMonitor battery;
+  bool lastExternalPower = false;
+  {
+    bool known = false;
+    const bool ext = battery.isExternalPowerPresent(&known);
+    lastExternalPower = known ? ext : battery.isCharging();
+  }
+
+  const int64_t deadlineUs = esp_timer_get_time() + STANDBY_US;
+  while (canLightSleep()) {
+    const int64_t remainingUs = deadlineUs - esp_timer_get_time();
+    if (remainingUs <= 0) return false;
+    const uint64_t sliceUs = static_cast<uint64_t>(std::min(remainingUs, USB_POLL_SLICE_US));
+    const auto cause = lightSleep(pins, sliceUs);
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) return false;
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+      uint32_t lowMs = 0;
+      while (lowMs < PRESS_STABLE_MS && gpio.isPowerButtonPhysicallyPressed()) {
+        delay(5);
+        lowMs += 5;
+      }
+      if (lowMs >= PRESS_STABLE_MS) return true;
+      continue;
+    }
+    bool known = false;
+    const bool ext = battery.isExternalPowerPresent(&known);
+    const bool externalPower = known ? ext : battery.isCharging();
+    if (externalPower && !lastExternalPower) {
+      // Allow USB-Serial-JTAG to enumerate if a real host was plugged in; stay asleep on dumb chargers.
+      for (uint32_t waited = 0; waited < USB_ENUM_WAIT_MS; waited += 10) {
+        if (gpio.isUsbSerialActive() || gpio.isPowerButtonPhysicallyPressed()) return true;
+        delay(10);
+      }
+    }
+    lastExternalPower = externalPower;
+  }
+  return gpio.isUsbSerialActive() || gpio.isPowerButtonPhysicallyPressed();
 }
 #endif
 
