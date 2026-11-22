@@ -19,7 +19,8 @@ struct DirectPixelWriter {
   uint8_t* fb;
   GfxRenderer::RenderMode mode;
   bool absolute = false;
-  bool ditherBw = false;       // images on a B/W-only page: dither in BW, skip the gray planes
+  bool ditherBw = false;  // images on a B/W-only page: dither in BW, skip the gray planes
+  int displayWidth;
   uint16_t displayWidthBytes;  // Runtime framebuffer stride (X4: 100, X3: 99)
   // Active write target: for tiled grayscale, fb is the band scratch, originY is
   // the band's top physical row, and clipRows is the band height. Off-band
@@ -48,7 +49,8 @@ struct DirectPixelWriter {
     ditherBw = renderer.imagesDitheredInBw();
     displayWidthBytes = renderer.getDisplayWidthBytes();
 
-    const int phyW = renderer.getDisplayWidth();
+    displayWidth = renderer.getDisplayWidth();
+    const int phyW = displayWidth;
     const int phyH = renderer.getDisplayHeight();
 
     switch (renderer.getOrientation()) {
@@ -150,7 +152,6 @@ struct DirectPixelWriter {
 
   // Write a single 2-bit dithered pixel value to the framebuffer.
   // Must be called after beginRow() for the current row.
-  // No bounds checking — caller guarantees coordinates are valid.
   inline void writePixel(int logicalX, uint8_t pixelValue, bool writeWhiteInBw = false) const {
     // Determine whether to draw based on render mode
     bool draw;
@@ -182,6 +183,7 @@ struct DirectPixelWriter {
     if (!draw) return;
 
     const int phyX = rowPhyXBase + logicalX * phyXStepX;
+    if (static_cast<unsigned>(phyX) >= static_cast<unsigned>(displayWidth)) return;
     const int phyY = rowPhyYBase + logicalX * phyYStepX;
 
     // Band-local row. The unsigned compare drops both off-band pixels (strip
@@ -189,7 +191,7 @@ struct DirectPixelWriter {
     const int sy = phyY - originY;
     if (static_cast<unsigned>(sy) >= static_cast<unsigned>(clipRows)) return;
 
-    const uint16_t byteIndex = static_cast<uint16_t>(sy * displayWidthBytes + (phyX >> 3));
+    const size_t byteIndex = static_cast<size_t>(sy) * displayWidthBytes + (phyX >> 3);
     const uint8_t bitMask = 1 << (7 - (phyX & 7));
 
     if (state) {

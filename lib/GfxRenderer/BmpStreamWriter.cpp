@@ -77,13 +77,14 @@ BmpStreamWriter::BmpStreamWriter() = default;
 BmpStreamWriter::~BmpStreamWriter() = default;
 
 bool BmpStreamWriter::begin(Print& output, const int width, const int height, const bool oneBit,
-                            const bool originalThresholds) {
+                            const bool originalThresholds, const QuantizePixel quantizePixel) {
   if (width <= 0 || height <= 0) return false;
 
   this->output = &output;
   this->width = width;
   this->height = height;
   this->oneBit = oneBit;
+  this->quantizePixel = quantizePixel;
   bytesPerRow = (width * (oneBit ? 1 : 2) + 31) / 32 * 4;
 
   packedRow = makeUniqueNoThrow<uint8_t[]>(bytesPerRow);
@@ -92,13 +93,13 @@ bool BmpStreamWriter::begin(Print& output, const int width, const int height, co
     return false;
   }
 
-  if (oneBit) {
+  if (!quantizePixel && oneBit) {
     atkinson1BitDitherer = makeUniqueNoThrow<Atkinson1BitDitherer>(width);
     if (!atkinson1BitDitherer || !atkinson1BitDitherer->isValid()) {
       LOG_ERR("BMP", "OOM: 1-bit ditherer");
       return false;
     }
-  } else {
+  } else if (!quantizePixel) {
     atkinsonDitherer = makeUniqueNoThrow<AtkinsonDitherer>(width, originalThresholds);
     if (!atkinsonDitherer || !atkinsonDitherer->isValid()) {
       LOG_ERR("BMP", "OOM: 2-bit ditherer");
@@ -119,15 +120,18 @@ bool BmpStreamWriter::writeRow(const uint8_t* grayRow, const int y) {
 
   if (oneBit) {
     for (int x = 0; x < width; x++) {
-      packedRow[x / 8] |= atkinson1BitDitherer->processPixel(grayRow[x], x) << (7 - x % 8);
+      const uint8_t level = quantizePixel ? quantizePixel(x, y, adjustPixel(grayRow[x]))
+                                          : atkinson1BitDitherer->processPixel(grayRow[x], x);
+      packedRow[x / 8] |= level << (7 - x % 8);
     }
-    atkinson1BitDitherer->nextRow();
+    if (!quantizePixel) atkinson1BitDitherer->nextRow();
   } else {
     for (int x = 0; x < width; x++) {
       const uint8_t gray = adjustPixel(grayRow[x]);
-      packedRow[(x * 2) / 8] |= atkinsonDitherer->processPixel(gray, x) << (6 - (x * 2) % 8);
+      const uint8_t level = quantizePixel ? quantizePixel(x, y, gray) : atkinsonDitherer->processPixel(gray, x);
+      packedRow[x / 4] |= level << (6 - (x % 4) * 2);
     }
-    atkinsonDitherer->nextRow();
+    if (!quantizePixel) atkinsonDitherer->nextRow();
   }
 
   if (output->write(packedRow.get(), bytesPerRow) != static_cast<size_t>(bytesPerRow)) {

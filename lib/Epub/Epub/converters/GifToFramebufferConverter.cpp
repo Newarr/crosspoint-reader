@@ -66,15 +66,16 @@ void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
   if (firstDstY >= endDstY || firstDstY >= ctx.dstHeight) return;
   if (endDstY > ctx.dstHeight) endDstY = ctx.dstHeight;
 
-  DirectPixelWriter pw;
-  pw.init(*ctx.renderer);
+  const bool cacheOnly = ctx.config->cacheOnly;
+  DirectPixelWriter pw{};
+  if (!cacheOnly) pw.init(*ctx.renderer);
 
   for (int dstY = firstDstY; dstY < endDstY; ++dstY) {
     ctx.lastDstY = dstY;
     const int outY = ctx.config->y + dstY;
-    if (outY >= ctx.screenHeight) continue;
+    if (!cacheOnly && outY >= ctx.screenHeight) continue;
 
-    pw.beginRow(outY);
+    if (!cacheOnly) pw.beginRow(outY);
 
     const bool caching = ctx.caching;
     DirectCacheWriter cw;
@@ -95,16 +96,16 @@ void renderCanvasRow(const uint8_t* grayRow, int srcY, GifContext& ctx) {
 
     for (int dstX = 0; dstX < ctx.dstWidth; ++dstX) {
       const int outX = outXBase + dstX;
-      if (outX < ctx.screenWidth) {
+      if (cacheOnly || outX < ctx.screenWidth) {
         const uint8_t gray = grayRow[srcX];
         uint8_t ditheredGray;
         if (useDithering) {
-          ditheredGray = applyBayerDither4Level(gray, outX, outY);
+          ditheredGray = applyBayerDither4Level(gray, dstX, dstY);
         } else {
           ditheredGray = gray / 85;
           if (ditheredGray > 3) ditheredGray = 3;
         }
-        pw.writePixel(outX, ditheredGray);
+        if (!cacheOnly) pw.writePixel(outX, ditheredGray);
         if (caching) cw.writePixel(outX, ditheredGray);
       }
 
@@ -250,6 +251,7 @@ bool GifToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
 
 bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
                                                     const RenderConfig& config) {
+  if (config.cacheOnly && config.cachePath.empty()) return false;
   LOG_DBG("GIF", "Decoding GIF: %s", imagePath.c_str());
 
   GifBasicInfo info;
@@ -291,8 +293,10 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   GifContext& ctx = *ctxPtr;
   ctx.renderer = &renderer;
   ctx.config = &config;
-  ctx.screenWidth = renderer.getScreenWidth();
-  ctx.screenHeight = renderer.getScreenHeight();
+  if (!config.cacheOnly) {
+    ctx.screenWidth = renderer.getScreenWidth();
+    ctx.screenHeight = renderer.getScreenHeight();
+  }
   ctx.srcWidth = sourceDimensions.width;
   ctx.srcHeight = sourceDimensions.height;
 
@@ -341,7 +345,8 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
 
   ctx.caching = !config.cachePath.empty();
   if (ctx.caching) {
-    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1)) {
+    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1,
+                         PixelCacheLayout::Versioned, config.useBilinear)) {
       LOG_ERR("GIF", "Failed to start cache stream");
       return false;
     }
@@ -350,8 +355,7 @@ bool GifToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   int delayMs = 0;
   ctx.lastYieldMs = millis();
   const int frameState = gif->playFrame(false, &delayMs, &ctx);
-  if (ctx.aborted || !ctx.success ||
-      (gif->getLastError() != GIF_SUCCESS && gif->getLastError() != GIF_EMPTY_FRAME)) {
+  if (ctx.aborted || !ctx.success || (gif->getLastError() != GIF_SUCCESS && gif->getLastError() != GIF_EMPTY_FRAME)) {
     if (ctx.aborted || ImageToFramebufferDecoder::isAborted()) {
       LOG_DBG("GIF", "GIF decode aborted");
     } else {

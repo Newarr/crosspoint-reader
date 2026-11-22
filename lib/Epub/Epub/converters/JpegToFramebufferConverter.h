@@ -5,13 +5,15 @@
 #include <string>
 
 #include "ImageToFramebufferDecoder.h"
+#include "PixelCacheFormat.h"
 
 class JpegToFramebufferConverter final : public ImageToFramebufferDecoder {
  public:
+  static bool decoderFitsHeap();
   static bool getDimensionsStatic(const std::string& imagePath, ImageDimensions& out);
 
   bool decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config) override;
-  // Reports successful cache writes separately from framebuffer rendering.
+  // The sleep-cover reader consumes a temporary width/height prefix.
   bool decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config,
                            bool& cacheWritten);
 
@@ -21,4 +23,8 @@ class JpegToFramebufferConverter final : public ImageToFramebufferDecoder {
 
   static bool supportsFormat(const std::string& extension);
   const char* getFormatName() const override { return "JPEG"; }
+
+ private:
+  bool decode(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config, PixelCacheLayout layout,
+              bool& cacheWritten);
 };
