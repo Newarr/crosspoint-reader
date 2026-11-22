@@ -7,6 +7,10 @@
 #include <XteinkDetect.h>
 #include <esp_sleep.h>
 
+#if FREEINK_MCU_C3
+#include <driver/usb_serial_jtag.h>
+#endif
+
 #if FREEINK_DEVICE_LILYGO
 #include <BoardT5S3.h>
 #endif
@@ -18,6 +22,7 @@ namespace {
 constexpr char HW_NAMESPACE[] = "cphw";
 constexpr char NVS_KEY_DEV_OVERRIDE[] = "dev_ovr";  // 0=auto, 1=x4, 2=x3
 constexpr char NVS_KEY_DEV_CACHED[] = "dev_det";    // 0=unknown, 1=x4, 2=x3
+constexpr uint32_t X3_USB_POLL_MS = 1000;
 
 enum class NvsDeviceValue : uint8_t { Unknown = 0, X4 = 1, X3 = 2 };
 
@@ -120,14 +125,21 @@ void HalGPIO::begin() {
 #endif
 }
 
+bool HalGPIO::beginAsync(uint32_t pollIntervalMs) { return inputMgr.beginAsync(pollIntervalMs); }
+
 void HalGPIO::update() {
   inputMgr.update();
   const uint8_t pageButtons = inputMgr.capacitivePageButtonMask();
   capacitivePagePressed = (pageButtons & ~previousCapacitivePageButtons) != 0;
   previousCapacitivePageButtons = pageButtons;
-  const bool connected = isUsbConnected();
-  usbStateChanged = (connected != lastUsbConnected);
-  lastUsbConnected = connected;
+  usbStateChanged = false;
+  const uint32_t now = millis();
+  if (deviceIsX3() && usbSampled && now - lastUsbPollMs < X3_USB_POLL_MS) return;
+  const bool connected = sampleUsbConnected();
+  lastUsbPollMs = now;
+  usbSampled = true;
+  usbStateChanged = connected != lastUsbConnected.load(std::memory_order_relaxed);
+  lastUsbConnected.store(connected, std::memory_order_relaxed);
 }
 
 bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
@@ -140,13 +152,20 @@ void HalGPIO::prepareForDeepSleep() {
 
 bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
 
+uint8_t HalGPIO::wasPressedCount(uint8_t buttonIndex) const { return inputMgr.wasPressedCount(buttonIndex); }
+
 bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
 
 bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
 
+uint8_t HalGPIO::wasReleasedCount(uint8_t buttonIndex) const { return inputMgr.wasReleasedCount(buttonIndex); }
+
+uint32_t HalGPIO::pressSequence() const { return inputMgr.pressSequence(); }
+
 bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
 bool HalGPIO::rawInputActive() {
+  if (inputMgr.isAsyncActive()) return inputMgr.rawContactActive();
   if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
 #if FREEINK_DEVICE_LILYGO
   if (BoardConfig::ACTIVE.board == BoardConfig::Board::LilyGoT5S3 && BoardT5S3::readButton()) return true;
@@ -234,6 +253,7 @@ bool HalGPIO::verifyPowerButtonWakeup() {
 
   constexpr unsigned long POWER_WAKE_STABILITY_MS = 10;
   const bool heldAtFirstSample = inputMgr.isPowerButtonPhysicallyPressed();
+  if (deviceIsX3() && !heldAtFirstSample) return false;
   const unsigned long sampleStart = millis();
   inputMgr.update();
   while (millis() - sampleStart < POWER_WAKE_STABILITY_MS || inputMgr.isDebouncePending()) {
@@ -244,6 +264,10 @@ bool HalGPIO::verifyPowerButtonWakeup() {
 }
 
 bool HalGPIO::isUsbConnected() const {
+  return deviceIsX3() ? lastUsbConnected.load(std::memory_order_relaxed) : sampleUsbConnected();
+}
+
+bool HalGPIO::sampleUsbConnected() const {
   if (!deviceIsX3() && BoardConfig::ACTIVE.usbDetect >= 0) {
     return digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
   }
@@ -260,6 +284,14 @@ bool HalGPIO::isUsbConnected() const {
   const bool present = battery.isExternalPowerPresent(&known);
   if (known) return present;
   return battery.isCharging();
+}
+
+bool HalGPIO::isUsbSerialActive() const {
+#if FREEINK_MCU_C3
+  return usb_serial_jtag_is_connected();
+#else
+  return false;
+#endif
 }
 
 bool HalGPIO::coldBootImpliesPowerButton() const {
@@ -279,20 +311,21 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
   const auto wakeupCause = esp_sleep_get_wakeup_cause();
   const auto resetReason = esp_reset_reason();
 
-  const bool usbConnected = isUsbConnected();
-
   if (resetReason == ESP_RST_DEEPSLEEP &&
       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
     return WakeupReason::PowerButton;
   }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected &&
-      coldBootImpliesPowerButton()) {
+  if (wakeupCause != ESP_SLEEP_WAKEUP_UNDEFINED || (resetReason != ESP_RST_POWERON && resetReason != ESP_RST_UNKNOWN)) {
+    return WakeupReason::Other;
+  }
+  const bool usbConnected = sampleUsbConnected();
+  if (resetReason == ESP_RST_POWERON && !usbConnected && coldBootImpliesPowerButton()) {
     return WakeupReason::PowerButton;
   }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
+  if (resetReason == ESP_RST_UNKNOWN && usbConnected) {
     return WakeupReason::AfterFlash;
   }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && usbConnected) {
+  if (resetReason == ESP_RST_POWERON && usbConnected) {
     return WakeupReason::AfterUSBPower;
   }
   return WakeupReason::Other;

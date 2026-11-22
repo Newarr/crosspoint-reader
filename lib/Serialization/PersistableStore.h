@@ -40,8 +40,14 @@ class PersistableStoreBase {
   void requestResave() { resaveRequested = true; }
 
   bool resaveRequested = false;
+  bool persistenceSuspended = false;
 
  public:
+  void suspendPersistence() {
+    std::lock_guard<std::mutex> lock(storeMutex);
+    persistenceSuspended = true;
+  }
+
   // Public so non-store JSON files (e.g. per-book bookmarks) can reuse them
   // instead of instantiating serializeJson/deserializeJson in their own TU —
   // that per-TU duplication is exactly what this class exists to prevent.
@@ -52,6 +58,9 @@ class PersistableStoreBase {
   // Reads path and parses it into doc. Returns false silently when the file
   // does not exist (expected on first boot); logs on read/parse failure.
   static bool readDocFromFile(const char* path, JsonDocument& doc);
+
+ private:
+  static bool recoverTempFile(const char* path, JsonDocument& doc);
 
  protected:
   /**
@@ -101,6 +110,7 @@ class PersistableStore : public PersistableStoreBase {
 
   bool saveToFile() const {
     std::lock_guard<std::mutex> lock(storeMutex);
+    if (persistenceSuspended) return false;
     JsonDocument doc;
     static_cast<const T*>(this)->toJson(doc);
     return writeDocToFile(T::getFilePath(), doc);
@@ -111,6 +121,7 @@ class PersistableStore : public PersistableStoreBase {
     bool doResave;
     {
       std::lock_guard<std::mutex> lock(storeMutex);
+      if (persistenceSuspended) return false;
       resaveRequested = false;
       JsonDocument doc;
       if (!readDocFromFile(T::getFilePath(), doc)) {

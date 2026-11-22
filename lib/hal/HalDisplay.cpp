@@ -64,7 +64,15 @@ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen)
 
 bool HalDisplay::canStageNextFrame() const { return einkDisplay.canStageNextFrame(); }
 
-bool HalDisplay::stageNextFrame() { return einkDisplay.stageNextFrame(); }
+bool HalDisplay::stageNextFrame(bool (*shouldAbort)(void*), void* abortCtx) {
+  return einkDisplay.stageNextFrame(shouldAbort, abortCtx);
+}
+
+void HalDisplay::requestResync() { einkDisplay.requestResync(); }
+
+void HalDisplay::setBusyWaitSliceHook(bool (*sliceHook)(int8_t, uint8_t)) {
+  einkDisplay.setBusyWaitSliceHook(sliceHook);
+}
 
 bool HalDisplay::triggerStagedFastRefresh(bool turnOffScreen) {
   return einkDisplay.triggerStagedFastRefresh(turnOffScreen);
