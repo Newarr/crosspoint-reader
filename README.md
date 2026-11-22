@@ -27,8 +27,7 @@ Both builds ran the same 5 chapter EPUB (`bench_x3.epub`) on the same Xteink X3 
 | Skip during cold JPEG load | 3,343 ms | 400 ms | **8.37x faster** |
 | Skip during cold PNG load | 3,762 ms | 394 ms | **9.54x faster** |
 | Skip during cold GIF load | 2,469 ms | 575 ms | **4.29x faster** |
-| Standby wake (`Quick Resume` / `Blank`) | ~2,000 ms wall (1,428 ms app) | ~400 ms | **~5x faster** |
-| Standby wake (other sleep screens) | ~2,000 ms wall (1,428 ms app) | ~900 ms (turn 1 at 286 ms) | **~2.2x faster** |
+| Battery sleep wake (median, app timer) | 1,428 ms (~2.0 s cold boot wall time) | 1,110 ms (15 ms GPIO + panel wake) | **1.29x faster app timer** |
 | Idle free DRAM (largest block) | 134,552 B (114,676 B) | 131,272 B (114,676 B) | **Same contiguous headroom** |
 
 ## Image dithering: Bayer grid vs blue noise
