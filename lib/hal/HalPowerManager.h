@@ -5,7 +5,9 @@
 #include <InputManager.h>
 #include <Logging.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 
+#include <atomic>
 #include <cassert>
 
 #include "HalGPIO.h"
@@ -16,9 +18,17 @@ extern HalPowerManager powerManager;  // Singleton
 class HalPowerManager {
   int normalFreq = 0;  // MHz
   bool isLowPower = false;
+  uint32_t lastNormalSpeedPokeMs = 0;
+  bool normalSpeedDwell = false;
 
   mutable int _batteryCachedPercent = 0;         // Last read battery percentage (0-100)
   mutable unsigned long _batteryLastPollMs = 0;  // Timestamp of last battery read in milliseconds
+  std::atomic<int> x3BatteryPercent{-1};
+  std::atomic<bool> x3BatteryReadPending{false};
+  TaskHandle_t x3BatteryTask = nullptr;
+  uint32_t x3BatteryLastPollMs = 0;
+  bool x3BatteryPolled = false;
+  void updateBatteryCache();
 
   enum LockMode { None, NormalSpeed };
   LockMode currentLockMode = None;
@@ -32,11 +42,20 @@ class HalPowerManager {
 #endif
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
+  static constexpr uint32_t NORMAL_POWER_DWELL_MS = 2000;
 
   void begin();
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
+  void pokeNormalSpeed();
+
+#if FREEINK_MCU_C3
+  bool canLightSleep() const;
+  bool lightSleepBetweenTurns() const;
+  bool lightSleepWhileDisplayBusy(int8_t busyPin, uint8_t busyLevel) const;
+  bool lightSleepStandby() const;
+#endif
 
   // Setup wake up GPIO and enter deep sleep
   // Should be called inside main loop() to handle the currentLockMode
@@ -55,6 +74,9 @@ class HalPowerManager {
 
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;
+  int getCachedBatteryPercent() const;
+  void beginBatteryCache();
+  void pollBatteryCache();
 
   // One fresh reading. False when the battery cannot be read, which
   // getBatteryPercentage() reports as its last value or 0.

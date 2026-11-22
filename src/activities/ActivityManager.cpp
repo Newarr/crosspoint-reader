@@ -81,7 +81,7 @@ void ActivityManager::renderTaskLoop() {
     // Acquire the lock before reading currentActivity to avoid a TOCTOU race
     // where the main task deletes the activity between the null-check and render().
     RenderLock lock;
-    if (currentActivity) {
+    if (currentActivity && !standbyScreenActive) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       // Night mode is a global output polarity applied to every activity.
       // The sleep screen forces normal polarity itself (SleepActivity).
@@ -103,7 +103,7 @@ void ActivityManager::renderTaskLoop() {
 }
 
 void ActivityManager::loop() {
-  if (mappedInput.consumeSuppressedRelease()) return;
+  if (mappedInput.consumeSuppressedRelease() && pendingAction != PendingAction::ReplaceForSleep) return;
 
   if (currentActivity && currentActivity->requiresExclusiveStorageLoop()) {
     currentActivity->loop();
@@ -351,6 +351,28 @@ void ActivityManager::goToSleep(bool fromTimeout) {
   replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, fromTimeout));
   if (pendingAction == PendingAction::Replace) pendingAction = PendingAction::ReplaceForSleep;
   loop();  // Important: sleep screen must be rendered immediately, the caller will go to sleep right after this returns
+}
+
+bool ActivityManager::showStandbyScreen() {
+  RenderLock lock;
+  if (!currentActivity || pendingAction != PendingAction::None) return false;
+  standbyScreenActive = true;
+  SleepActivity(renderer, mappedInput).onEnter();
+  return true;
+}
+
+void ActivityManager::finishStandby(bool woke) {
+  RenderLock lock;
+  standbyScreenActive = false;
+  if (woke) {
+    requestUpdate(true);
+    return;
+  }
+  exitActivity(lock);
+  while (!stackActivities.empty()) {
+    stackActivities.back()->onExit();
+    stackActivities.pop_back();
+  }
 }
 
 void ActivityManager::goToBoot() { replaceActivity(std::make_unique<BootActivity>(renderer, mappedInput)); }

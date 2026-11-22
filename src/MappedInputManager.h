@@ -82,7 +82,9 @@ class MappedInputManager {
   bool injectRemoteClick(RemoteButton button);
   bool hasRemoteClick() const { return remoteInput.button != RemoteButton::None; }
   bool wasPressed(Button button) const;
+  uint8_t wasPressedCount(Button button) const;
   bool wasReleased(Button button) const;
+  uint8_t wasReleasedCount(Button button) const;
   // One-shot threshold event while the button is down; consumes its release.
   bool wasLongPressed(Button button, unsigned long thresholdMs) const;
   bool consumeSuppressedRelease() const;
@@ -166,6 +168,8 @@ class MappedInputManager {
   bool areSidePageButtonsSwapped() const;
   Labels mapFrontLabels(const char* back, const char* confirm, const char* left, const char* right) const;
   bool mapButton(Button button, bool (HalGPIO::*fn)(uint8_t) const) const;
+  uint8_t physicalButtons(Button button) const;
+  uint8_t countButtonEdges(Button button, uint8_t (HalGPIO::*count)(uint8_t) const) const;
   // SDK edge classification (fui::edgeSwipe) + the shared decode/held-time
   // bookkeeping; the wrappers below give each edge its board meaning.
   bool wasEdgeSwipe(freeink::ui::ScreenEdge edge) const;

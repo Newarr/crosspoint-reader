@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <InputManager.h>
 
+#include <atomic>
+
 // Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
 #define EPD_SCLK 8   // SPI Clock
 #define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
@@ -43,7 +45,9 @@ class HalGPIO {
   InputManager inputMgr;
 #endif
 
-  bool lastUsbConnected = false;
+  std::atomic<bool> lastUsbConnected{false};
+  bool usbSampled = false;
+  uint32_t lastUsbPollMs = 0;
   bool usbStateChanged = false;
   uint8_t previousCapacitivePageButtons = 0;
   bool capacitivePagePressed = false;
@@ -53,6 +57,7 @@ class HalGPIO {
 
  private:
   DeviceType _deviceType = DeviceType::X4;
+  bool sampleUsbConnected() const;
 
  public:
   HalGPIO() = default;
@@ -70,6 +75,7 @@ class HalGPIO {
 
   // Start button GPIO and setup SPI for screen and SD card
   void begin();
+  bool beginAsync(uint32_t pollIntervalMs = 5);
   void prepareForDeepSleep();
 
   // Button input methods
@@ -83,8 +89,11 @@ class HalGPIO {
 #endif
   }
   bool wasPressed(uint8_t buttonIndex) const;
+  uint8_t wasPressedCount(uint8_t buttonIndex) const;
   bool wasAnyPressed() const;
   bool wasReleased(uint8_t buttonIndex) const;
+  uint8_t wasReleasedCount(uint8_t buttonIndex) const;
+  uint32_t pressSequence() const;
   bool wasAnyReleased() const;
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
@@ -135,6 +144,7 @@ class HalGPIO {
 
   // Check if USB is connected
   bool isUsbConnected() const;
+  bool isUsbSerialActive() const;
 
   // Whether a cold boot with no USB detected can be trusted to mean a held
   // power button (Xteink-style button-energized rail with reliable USB
