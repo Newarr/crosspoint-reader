@@ -1,4 +1,54 @@
-# CrossPoint Reader
+# CrossPoint Reader (`x3fast`)
+
+This fork tunes CrossPoint Reader 2.0.0 for the Xteink X3 (UC8279 and UC8253 panels). It pairs with [Newarr/freeink-sdk](https://github.com/Newarr/freeink-sdk). Upstream `develop` stays untouched for syncing.
+
+## Xteink X3 benchmarks
+
+Both builds ran the same 5 chapter EPUB on an Xteink X3 (UC8279, 528x792). See [docs/x3fast-benchmark.md](docs/x3fast-benchmark.md) for full numbers and dithering comparisons.
+
+![Xteink X3 Latency Chart](./docs/images/x3fast-latency-chart.png)
+
+| Action | Stock 2.0.0 | `x3fast` | Speedup |
+|---|---:|---:|---:|
+| Normal page turn (median) | 566 ms | 286 ms | 1.97x |
+| Rapid 4 tap skim (150 ms apart) | 1,195 ms (2 of 4 moved) | 933 ms (4 of 4 moved) | 1.28x |
+| Chapter boundary turn (median) | 905 ms | 434 ms | 2.08x |
+| Cold JPEG / PNG / GIF to B/W | 1,790 / 2,226 / 1,367 ms | 553 / 562 / 683 ms | 3.23x / 3.96x / 2.00x |
+| Skip during cold JPEG / PNG / GIF | 3,343 / 3,762 / 2,469 ms | 400 / 394 / 575 ms | 8.37x / 9.54x / 4.29x |
+| Standby wake from sleep | ~2,000 ms wall time (1,428 ms app) | ~400 ms (`Quick Resume` / `Blank`), ~900 ms (full clear) | 2x to 5x |
+
+Key changes in `x3fast`:
+
+- **Display and input**: 20 MHz SPI, cached LUT loads, interruptible next page staging, 5 ms async input sampling, and idle controller power off.
+- **Reader and images**: background next chapter prebuild, cancellable image decodes, B/W first image rendering with deferred 4 gray upgrade, and 64x64 blue noise dithering.
+- **Standby and storage**: ESP32 C3 light sleep standby with fast wake, plus SD card probe and remount on wake after card removal.
+
+## Flash on Xteink X3
+
+1. Download `crosspoint-2.0.0-x3fast7.bin` from [Releases](https://github.com/Newarr/crosspoint-reader/releases).
+2. Copy the file to the root of your X3 SD card.
+3. Open CrossPoint on your X3 and flash the file through the SD firmware updater.
+
+## Build from source
+
+1. Clone this repository with its SDK submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/Newarr/crosspoint-reader.git
+cd crosspoint-reader
+```
+
+2. Build the X3 target with PlatformIO:
+
+```bash
+pio run -e x3_fast
+```
+
+The built binary sits at `.pio/build/x3_fast/firmware.bin`.
+
+---
+
+# CrossPoint Reader (Upstream)
 
 [![Fund contributors](https://img.shields.io/badge/%F0%9F%91%91_Fund_contributors-royalty.dev-BB953A?style=for-the-badge&labelColor=1a1a1a)](https://app.royalty.dev/crosspoint-reader/crosspoint-reader)
 
